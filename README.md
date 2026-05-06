@@ -41,14 +41,18 @@ echo "BINANCE_API_SECRET=your_api_secret" >> .env
 
 ### 启动模拟交易
 
-```bash
-# 方式一：环境变量
-SIMULATE=true python trader.py status
+openclaw cron 添加计划 1分钟一次
+内容如下
 
-# 方式二：PowerShell
-$env:SIMULATE="true"
-python trader.py status
-```
+读取 /Volumes/data/openclaw-workspace/trading_program/SKILL.md，严格按照里面的内容分步骤执行交易。
+严禁修改交易程序和skill.md
+实盘交易
+
+一天整理一次记忆
+
+请执行每日教训整理：\n\n1. 读取 /Users/sin/.openclaw/workspace/trading_program/memory/ 目录下所有 .md 文件\n2. 整理每条教训/经验/错误记录，去重\n3. 写入 YYYY-MM-DD.md（今天日期）\n4. 删除已整理的旧文件（保留汇总文件）\n5. 标记重复教训及原因\n6. 汇报：整理了多少条，多少条重复
+
+
 
 ## 使用命令
 
