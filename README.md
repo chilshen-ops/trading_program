@@ -1,6 +1,7 @@
 # Binance Perpetual Futures Trading Bot
 <img width="442" height="201" alt="2b556c8f848c738f06efef92574b60aa" src="https://github.com/user-attachments/assets/14218fe9-7e05-4bea-8deb-4e2f9af7be1b" />
-<img width="1140" height="1899" alt="0a3a4a51fbf061afa19bf078886fefe6" src="https://github.com/user-attachments/assets/5bbb0a17-2b60-4b5a-a6bb-84b46f6a20b5" />
+<img width="516" height="384" alt="91ae2ef83002021f1fe1e90e894fbbaf" src="https://github.com/user-attachments/assets/d67a2732-e128-4f51-b748-b50c950bba22" />
+
 
 
 打赏随意
