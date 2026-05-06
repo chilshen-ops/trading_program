@@ -45,6 +45,7 @@ $env:BINANCE_API_SECRET="your_api_secret"
 echo "BINANCE_API_KEY=your_api_key" > .env
 echo "BINANCE_API_SECRET=your_api_secret" >> .env
 ```
+可以直接叫openclaw 录入
 
 ### 启动模拟交易
 
@@ -53,67 +54,13 @@ openclaw cron 添加计划 1分钟一次
 
 读取 trading_program/SKILL.md，严格按照里面的内容分步骤执行交易。
 严禁修改交易程序和skill.md
-实盘交易
+实盘交易 模拟交易 这里切换
 
 一天整理一次记忆
 
 请执行每日教训整理：\n\n1. 读取 trading_program/memory/ 目录下所有 .md 文件\n2. 整理每条教训/经验/错误记录，去重\n3. 写入 YYYY-MM-DD.md（今天日期）\n4. 删除已整理的旧文件（保留汇总文件）\n5. 标记重复教训及原因\n6. 汇报：整理了多少条，多少条重复
 
 
-
-## 使用命令
-
-### 扫描交易机会
-
-```bash
-# 统一波动率扫描（推荐）
-python trader.py scan-all --top 10 --min-vol 5.0 --klines 10
-
-# 扫描做空候选
-python trader.py scan-short --min-change 10
-
-# 扫描做多候选
-python trader.py scan-long --min-change -10 --max-change -3
-```
-
-### 账户操作
-
-```bash
-# 查看账户状态
-python trader.py status
-
-# 查看市场数据
-python trader.py market --symbol BTCUSDT
-```
-
-### 交易执行
-
-```bash
-# 开多仓
-python trader.py open-long 10 --symbol BTCUSDT --leverage 10
-
-# 开空仓
-python trader.py open-short 10 --symbol BTCUSDT --leverage 10
-
-# 平多仓
-python trader.py close-long --symbol BTCUSDT
-
-# 平空仓
-python trader.py close-short --symbol BTCUSDT
-
-# 部分平仓（50%）
-python trader.py close-long --symbol BTCUSDT --percent 50
-```
-
-### LLM 分析
-
-```bash
-# 分析开仓机会
-python trader.py llm-open --symbol BTCUSDT
-
-# 分析持仓决策
-python trader.py llm-hold --symbol BTCUSDT
-```
 
 ## 项目结构
 
@@ -127,13 +74,6 @@ trading_program/
 └── memory/            # 历史交易记录
 ```
 
-## 安全警告
-
-- **切勿将 API Secret 提交到公开仓库**
-- 建议创建只读 API Key 用于交易
-- 启用 IP 白名单限制
-- 大额账户建议开启二次验证
-- 生产环境请使用独立的交易账户
 
 ## 免责声明
 
