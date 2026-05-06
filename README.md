@@ -1,7 +1,10 @@
 # Binance Perpetual Futures Trading Bot
+<img width="442" height="201" alt="2b556c8f848c738f06efef92574b60aa" src="https://github.com/user-attachments/assets/14218fe9-7e05-4bea-8deb-4e2f9af7be1b" />
+<img width="442" height="201" alt="2b556c8f848c738f06efef92574b60aa" src="https://github.com/user-attachments/assets/78ebb509-7eba-4570-aa73-0a98b66f4a27" />
 
+打赏随意
 币安永续合约量化交易机器人，支持模拟交易/实盘交易。
-
+文件放在openclaw workspace 目录下
 ## 功能特性
 
 - **多周期K线分析**：5m / 30m / 1h / 24h 数据采集
@@ -44,13 +47,13 @@ echo "BINANCE_API_SECRET=your_api_secret" >> .env
 openclaw cron 添加计划 1分钟一次
 内容如下
 
-读取 /Volumes/data/openclaw-workspace/trading_program/SKILL.md，严格按照里面的内容分步骤执行交易。
+读取 trading_program/SKILL.md，严格按照里面的内容分步骤执行交易。
 严禁修改交易程序和skill.md
 实盘交易
 
 一天整理一次记忆
 
-请执行每日教训整理：\n\n1. 读取 /Users/sin/.openclaw/workspace/trading_program/memory/ 目录下所有 .md 文件\n2. 整理每条教训/经验/错误记录，去重\n3. 写入 YYYY-MM-DD.md（今天日期）\n4. 删除已整理的旧文件（保留汇总文件）\n5. 标记重复教训及原因\n6. 汇报：整理了多少条，多少条重复
+请执行每日教训整理：\n\n1. 读取 trading_program/memory/ 目录下所有 .md 文件\n2. 整理每条教训/经验/错误记录，去重\n3. 写入 YYYY-MM-DD.md（今天日期）\n4. 删除已整理的旧文件（保留汇总文件）\n5. 标记重复教训及原因\n6. 汇报：整理了多少条，多少条重复
 
 
 
