@@ -1,4 +1,6 @@
 # Binance Perpetual Futures Trading Bot
+ 本程序要配合openclaw cron ，交易闭环，先模拟跑几天后自己会成为高手
+
 <img width="442" height="201" alt="2b556c8f848c738f06efef92574b60aa" src="https://github.com/user-attachments/assets/14218fe9-7e05-4bea-8deb-4e2f9af7be1b" />
 <img width="516" height="384" alt="91ae2ef83002021f1fe1e90e894fbbaf" src="https://github.com/user-attachments/assets/d67a2732-e128-4f51-b748-b50c950bba22" />
 
