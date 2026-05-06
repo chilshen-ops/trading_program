@@ -1,6 +1,7 @@
 # Binance Perpetual Futures Trading Bot
 <img width="442" height="201" alt="2b556c8f848c738f06efef92574b60aa" src="https://github.com/user-attachments/assets/14218fe9-7e05-4bea-8deb-4e2f9af7be1b" />
-<img width="442" height="201" alt="2b556c8f848c738f06efef92574b60aa" src="https://github.com/user-attachments/assets/78ebb509-7eba-4570-aa73-0a98b66f4a27" />
+<img width="1140" height="1899" alt="0a3a4a51fbf061afa19bf078886fefe6" src="https://github.com/user-attachments/assets/5bbb0a17-2b60-4b5a-a6bb-84b46f6a20b5" />
+
 
 打赏随意
 币安永续合约量化交易机器人，支持模拟交易/实盘交易。
