@@ -201,11 +201,11 @@ def check_and_trigger_stops(sl: float = None, tp: float = None):
                 state['positions'][symbol] = {
                     'entry': entry, 'side': side, 'qty': qty, 'leverage': lev,
                     'sl_price': sl_price,
-                    'peak_price': current_price if side == 'SHORT' else entry,
+                    'peak_price': max(entry, current_price) if side == 'SHORT' else min(entry, current_price),
                     'trough_price': current_price if side == 'LONG' else entry,
                     'sl': _sl, 'tp': _tp,
                 }
-                print(f"[MONITOR] 跟踪 {symbol} {side} x{qty} @ {entry} | SL@{sl_price}", file=sys.stderr)
+                print(f"[MONITOR] 跟踪 {symbol} {side} x{qty} @ {entry:.6g} | SL@{sl_price:.6g}", file=sys.stderr)
             else:
                 s = state['positions'][symbol]
                 sl_price = s.get('sl_price')
@@ -223,9 +223,9 @@ def check_and_trigger_stops(sl: float = None, tp: float = None):
 
                 # 移动止盈检查
                 tp_triggered = False
-                if side == 'SHORT' and peak > 0 and current_price <= peak * (1 - _tp):
+                if side == 'SHORT' and trough > 0 and current_price >= trough * (1 + _tp):
                     tp_triggered = True
-                elif side == 'LONG' and trough > 0 and current_price >= trough * (1 + _tp):
+                elif side == 'LONG' and peak > 0 and current_price <= peak * (1 - _tp):
                     tp_triggered = True
 
                 if tp_triggered:
@@ -263,39 +263,6 @@ def check_and_trigger_stops(sl: float = None, tp: float = None):
 
     _save_monitor_state(state)
     return triggered
-
-
-def close_position(self, symbol: str, quantity: float = None) -> Dict:
-    """平仓（通用：多头用SELL，空头用BUY）"""
-    import math
-    positions = self.get_positions(symbol)
-    if not positions:
-        raise Exception(f"无持仓: {symbol}")
-    pos = positions[0]
-    if quantity is None:
-        quantity = abs(pos['amount'])
-    qty_int = max(1, math.floor(quantity))
-    if is_portfolio_margin():
-        return self.papi.papi_create_um_order(
-            symbol=symbol,
-            side='SELL' if pos['positionSide'] == 'LONG' else 'BUY',
-            type='MARKET',
-            quantity=qty_int
-        )
-    params = {
-        'symbol': symbol,
-        'side': 'BUY' if pos['positionSide'] == 'SHORT' else 'SELL',
-        'positionSide': pos['positionSide'],
-        'type': 'MARKET',
-        'quantity': quantity,
-        'timestamp': int(time.time()*1000),
-    }
-    params['signature'] = self._sign(params)
-    r = requests.post(f"{self.fapi_url}/fapi/v1/order",
-                      headers={'X-MBX-APIKEY': self.api_key}, params=params, timeout=10)
-    if r.status_code != 200:
-        raise Exception(f"close_position Error {r.status_code}: {r.text}")
-    return r.json()
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -576,6 +543,38 @@ class BinanceTrader:
         if 'totalAvailableBalance' in account:
             return float(account.get('totalAvailableBalance', 0))
         return 0.0
+
+    def close_position(self, symbol: str, quantity: float = None) -> Dict:
+        """平仓（通用：多头用SELL，空头用BUY）"""
+        import math
+        positions = self.get_positions(symbol)
+        if not positions:
+            raise Exception(f"无持仓: {symbol}")
+        pos = positions[0]
+        if quantity is None:
+            quantity = abs(pos['amount'])
+        qty_int = max(1, math.floor(quantity))
+        if is_portfolio_margin():
+            return self.papi.papi_create_um_order(
+                symbol=symbol,
+                side='SELL' if pos['positionSide'] == 'LONG' else 'BUY',
+                type='MARKET',
+                quantity=qty_int
+            )
+        params = {
+            'symbol': symbol,
+            'side': 'BUY' if pos['positionSide'] == 'SHORT' else 'SELL',
+            'positionSide': pos['positionSide'],
+            'type': 'MARKET',
+            'quantity': quantity,
+            'timestamp': int(time.time()*1000),
+        }
+        params['signature'] = self._sign(params)
+        r = requests.post(f"{self.fapi_url}/fapi/v1/order",
+                          headers={'X-MBX-APIKEY': self.api_key}, params=params, timeout=10)
+        if r.status_code != 200:
+            raise Exception(f"close_position Error {r.status_code}: {r.text}")
+        return r.json()
 
     # ---- 交易操作(PAPI um_order)----
     def set_leverage(self, symbol: str, leverage: int) -> Dict:
@@ -1314,7 +1313,7 @@ def scan_short_candidates(min_change: float = 10) -> List[Dict]:
 
     for c in candidates[:10]:
         print(f"\n{'='*60}")
-        print(f"[做空候选] {c['symbol']} | 价格={c['price']:.6f} | 24h涨幅={c['change_24h']:+.2f}% | 24h成交额={c['volume_24h']:.0f}U")
+        print(f"[做空候选] {c['symbol']} | 价格={c['price']:.6g} | 24h涨幅={c['change_24h']:+.2f}% | 24h成交额={c['volume_24h']:.0f}U")
         print(f"{'='*60}")
         for iv in ["5m", "30m", "1h", "4h"]:
             kl = c['klines'].get(iv, [])
@@ -1488,7 +1487,7 @@ def scan_long_candidates(min_change: float = -10, max_change: float = -3) -> Lis
 
     for c in results[:10]:
         print(f"\n{'='*60}")
-        print(f"[做多候选] {c['symbol']} | 价格={c['price']:.6f} | 24h跌幅={c['change_24h']:+.2f}% | 24h成交额={c['volume_24h']:.0f}U")
+        print(f"[做多候选] {c['symbol']} | 价格={c['price']:.6g} | 24h跌幅={c['change_24h']:+.2f}% | 24h成交额={c['volume_24h']:.0f}U")
         print(f"{'='*60}")
         for iv in ["5m", "30m", "1h", "4h"]:
             kl = c['klines'].get(iv, [])

@@ -46,15 +46,7 @@ cd ~/.openclaw/workspace/trading_program
 # =============================================
 SIMULATE=true python3 trader.py scan-all --top 10 --min-vol 5.0 --klines 10
 
-# =============================================
-# 做空候选扫描（多线程并发）
-# =============================================
-SIMULATE=true python3 trader.py scan-short --min-change 10
 
-# =============================================
-# 做多候选扫描（多线程并发）
-# =============================================
-SIMULATE=true python3 trader.py scan-long --min-change -10 --max-change -3
 
 # =============================================
 # 账户 & 市场数据
@@ -72,8 +64,8 @@ SIMULATE=true python3 trader.py llm-open --symbol=XXX       # LLM分析开仓
 # 交易执行（实盘无需 SIMULATE=true）
 # =============================================
 # 开仓后由 monitor 命令自动监控止损/移动止盈（程序内置，非交易所条件单）
-python3 trader.py open-long 10 --symbol=XXX --leverage=10 --sl 2 --tp 1                # 开多+自定义止损2%/移动止盈1%
-python3 trader.py open-short 10 --symbol=XXX --leverage=10 --sl 1.5 --tp 1             # 开空+自定义止损1.5%/移动止盈1%
+python3 trader.py open-long 10 --symbol=XXX --leverage=10 --sl 1.5-2.5 --tp 1-3                # 开多+自定义止损2%/移动止盈1%
+python3 trader.py open-short 10 --symbol=XXX --leverage=10 --sl 1.5-2.5 --tp 1-3             # 开空+自定义止损1.5%/移动止盈1%
 python3 trader.py close-long --symbol=XXX                                         # 平多
 python3 trader.py close-long --symbol=XXX --percent=50                        # 平多(减仓50%)
 python3 trader.py close-short --symbol=XXX                                        # 平空
@@ -87,7 +79,7 @@ python3 trader.py close-short --symbol=XXX --percent=50                       # 
 # 止损止盈监控
 # =============================================
 # 常驻守护进程（建议，开仓后启动）
-nohup python3 trader.py monitor --sl 1.5 --tp 0.8 --interval 5 &
+nohup python3 trader.py monitor --sl 1.5-2.5 --tp 1-3 --interval 5 &
 
 # 重置监控状态
 python3 trader.py monitor --reset
@@ -147,16 +139,17 @@ python3 trader.py monitor --reset
 ### 步骤3：获取币种+执行决策
 - 获取币种 默认：`--top 10 --min-vol 5.0 --klines 10`
 - 根据交易规则执行决策
-- 开仓→根据总资产，胜率，仓位比例，策略模式计算出合理的仓位比例(20-80%)、杠杠倍数  `--leverage ` 1-10、止损 `--sl` 1.5-2.5 止盈 `--tp` 2-5 ，然后执行开仓（开多开空都要计算）
-- 开仓后 运行止损止盈监控 确保只有一个monitor实例 
-- 检查是否开仓成功，止盈止损是否设置成功
-- 观望→如果没有可交易的币种(无信号)则扩大 `--top --klines ` 10-50， `--min-vol ` 3.0-5.0 范围
+- 开仓：
+1.根据总资产，胜率，仓位比例，策略模式计算出合理的仓位比例(20-80%)、杠杠倍数  `--leverage` 1-10、止损 `--sl` 1.5-2.5 止盈 `--tp` 1-2 ，然后执行开仓（开多开空都要计算）
+2.检查确认是否开仓成功
+- 观望：
+1.如果没有可交易的币种(无信号)则扩大 `--top --klines` 10-50，`--min-vol` 3.0-5.0 范围
 
 ### 步骤4：持仓管理
 分析持仓币种：
 - monitor 命令自动执行止盈止损（程序内置，非交易所条件单）
 - 止损：`STOP_MARKET`（做空=价格涨sl%触发，做多=价格跌sl%触发，sl默认1.5%）
-- 止盈：`TRAILING_STOP_MARKET`（价格从峰值回落tp%触发，tp默认0.8%，可由LLM在开仓时自定义）
+- 止盈：`TRAILING_STOP_MARKET`（价格从峰值回落tp%触发，tp默认0.8%）
 - 出现反向信号 → LLM 判断是否手动平仓
 - 判断当前走势是否破坏原有逻辑。如果逻辑未变，坚持持有；如果逻辑破坏，立即平仓。
 
