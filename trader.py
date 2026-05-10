@@ -9,15 +9,24 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Fix SSL: use certifi CA bundle BEFORE requests import
+import certifi
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
 try:
     import requests
 except ImportError:
     print("Error: requests module not installed. Run: pip install requests")
     sys.exit(1)
 
-# Fix SSL: use certifi CA bundle for macOS system SSL issues
-import certifi
-os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+# Monkey-patch requests to always use certifi CA bundle
+_old_send = requests.adapters.HTTPAdapter.send
+
+def _patched_send(self, request, *args, **kwargs):
+    kwargs.setdefault('verify', certifi.where())
+    return _old_send(self, request, *args, **kwargs)
+
+requests.adapters.HTTPAdapter.send = _patched_send
 
 # ========== 配置 ==========
 API_KEY_FILE = os.path.join(os.path.dirname(__file__), '.binance_api')
@@ -40,290 +49,62 @@ PAPI_URL = "https://papi.binance.com"
 SIMULATE = os.environ.get('SIMULATE', 'false').lower() == 'true'
 
 # ========== 模拟交易状态持久化 ==========
-SL_PCT = 0.015   # 止损 1.5%（基于历史统计调整）
-TP_PCT = 0.008   # 移动止盈 0.8%（回调即触发，基于历史统计调整）
 
 SIM_STATE_FILE = os.path.join(os.path.dirname(__file__), '.sim_state.json')
+_CONDITIONAL_ORDERS_FILE = os.path.join(os.path.dirname(__file__), '.conditional_orders.json')
+
+# Module-level simulation state
+_sim_balance = 1000.0
+_sim_positions = {}
 
 def _load_sim_state():
-    """从文件加载模拟状态"""
+    """从文件加载模拟状态
+    
+    Returns:
+        tuple: (balance, positions) — 总是返回 tuple，加载失败时返回默认值
+    """
     if os.path.exists(SIM_STATE_FILE):
         try:
             with open(SIM_STATE_FILE, 'r') as f:
                 state = json.load(f)
-            return (state.get('balance', 1000.0),
-                    state.get('positions', {}),
-                    state.get('stop_losses', {}))
-        except:
-            pass
-    return 1000.0, {}, {}
+            global _sim_balance, _sim_positions
+            _sim_balance = state.get('balance', 1000.0)
+            _sim_positions = state.get('positions', {})
+            return (_sim_balance, _sim_positions)
+        except Exception:
+            pass  # 文件损坏时仍返回默认值，保持一致性
+    return (1000.0, {})
 
-def _save_sim_state(balance, positions, stop_losses=None):
+def _save_sim_state(balance, positions):
     """保存模拟状态到文件"""
+    global _sim_balance, _sim_positions
+    _sim_balance = balance
+    _sim_positions = positions
     try:
         with open(SIM_STATE_FILE, 'w') as f:
-            json.dump({'balance': balance, 'positions': positions, 'stop_losses': stop_losses or {}}, f)
+            json.dump({'balance': balance, 'positions': positions}, f)
     except:
         pass
 
-# ========== 辅助函数:检查止损 + 移动止盈 ==========
-MONITOR_STATE_FILE = os.path.join(os.path.dirname(__file__), '.monitor_state.json')
-MONITOR_PID_FILE = os.path.join(os.path.dirname(__file__), '.monitor.pid')
 
-def _load_monitor_state() -> dict:
-    try:
-        with open(MONITOR_STATE_FILE) as f:
-            return json.load(f)
-    except:
-        return {'positions': {}}
-
-def _save_monitor_state(state: dict):
-    with open(MONITOR_STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
-
-def check_and_trigger_stops(sl: float = None, tp: float = None):
-    """
-    检查是否触发止损/移动止盈（实盘+模拟双模式）
-    - sl/tp: 可传入（百分比数字，内部转小数）
-    实盘从交易所读取持仓，模拟从本地状态读取
-    """
-    _sl = (sl / 100.0) if sl is not None else SL_PCT
-    _tp = (tp / 100.0) if tp is not None else TP_PCT
-    trader = BinanceTrader()
-    state = _load_monitor_state()
-    if 'positions' not in state:
-        state['positions'] = {}
-    triggered = []
-
-    # ---- 模拟模式：检查本地持仓 ----
-    if SIMULATE:
-        global _sim_balance, _sim_positions, _sim_stop_losses
-        for sym, sl_price in list(_sim_stop_losses.items()):
-            if sym not in _sim_positions:
-                del _sim_stop_losses[sym]
-                state['positions'].pop(sym, None)
-                continue
-            try:
-                klines = requests.get(f"{FAPI_URL}/fapi/v1/klines",
-                                      params={'symbol': sym, 'interval': '1m', 'limit': 1}, timeout=10).json()
-                current_price = float(klines[0][4])
-            except:
-                continue
-            pos = _sim_positions[sym]
-            entry = pos['entry_price']
-            qty = pos['qty']
-            lev = pos['leverage']
-            margin = pos['margin']
-            side = pos['side']
-            peak_price = pos.get('peak_price', entry)
-            trough_price = pos.get('trough_price', entry)
-
-            if side == 'SHORT' and current_price > peak_price:
-                peak_price = current_price
-                _sim_positions[sym]['peak_price'] = peak_price
-            elif side == 'LONG' and current_price < trough_price:
-                trough_price = current_price
-                _sim_positions[sym]['trough_price'] = trough_price
-
-            # 移动止盈检查
-            tp_triggered = False
-            if side == 'SHORT' and peak_price > 0 and current_price <= peak_price * (1 - _tp):
-                tp_triggered = True
-            elif side == 'LONG' and trough_price > 0 and current_price >= trough_price * (1 + _tp):
-                tp_triggered = True
-
-            if tp_triggered:
-                pnl = (entry - current_price) * qty * lev if side == 'SHORT' else (current_price - entry) * qty * lev
-                net_pnl = pnl - qty * current_price * 0.001
-                _sim_balance += margin + net_pnl
-                del _sim_positions[sym]
-                del _sim_stop_losses[sym]
-                state['positions'].pop(sym, None)
-                _save_sim_state(_sim_balance, _sim_positions, _sim_stop_losses)
-                _save_monitor_state(state)
-                print(f"[SIMULATE] 🟢 移动止盈触发 {sym} @ {current_price} 盈利={net_pnl:.4f}U 余额={_sim_balance:.4f}", file=sys.stderr)
-                triggered.append(sym)
-                continue
-
-            # 止损检查
-            sl_triggered = (side == 'SHORT' and current_price >= sl_price) or \
-                           (side == 'LONG' and current_price <= sl_price)
-            if sl_triggered:
-                pnl = (entry - sl_price) * qty * lev if side == 'SHORT' else (sl_price - entry) * qty * lev
-                net_pnl = pnl - qty * sl_price * 0.001
-                _sim_balance += margin - abs(net_pnl)
-                _sim_balance = max(0, _sim_balance)
-                del _sim_positions[sym]
-                del _sim_stop_losses[sym]
-                state['positions'].pop(sym, None)
-                _save_sim_state(_sim_balance, _sim_positions, _sim_stop_losses)
-                _save_monitor_state(state)
-                print(f"[SIMULATE] 🔴 止损触发 {sym} @ {sl_price} 损失={abs(net_pnl):.4f}U 余额={_sim_balance:.4f}", file=sys.stderr)
-                triggered.append(sym)
-                continue
-
-            # 更新峰值/谷值
-            if sym in state['positions']:
-                state['positions'][sym]['peak_price'] = peak_price
-                state['positions'][sym]['trough_price'] = trough_price
-                state['positions'][sym]['current_price'] = current_price
-
-    # ---- 实盘模式：检查交易所持仓 ----
-    if not SIMULATE:
+def _load_conditional_orders() -> Dict:
+    """从文件加载活跃条件单追踪"""
+    if os.path.exists(_CONDITIONAL_ORDERS_FILE):
         try:
-            exchange_positions = trader.papi.papi_get_um_position_risk()
-        except Exception as e:
-            print(f"[WARN] 获取实盘持仓失败: {e}", file=sys.stderr)
-            _save_monitor_state(state)
-            return triggered
+            with open(_CONDITIONAL_ORDERS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
-        active_symbols = set()
-        for ep in exchange_positions:
-            amt = float(ep.get('positionAmt', 0))
-            if amt == 0:
-                continue
-            symbol = ep['symbol']
-            entry = float(ep.get('entryPrice', 0))
-            lev = int(ep.get('leverage', 10))
-            side = 'SHORT' if amt < 0 else 'LONG'
-            qty = abs(amt)
-            active_symbols.add(symbol)
-
-            try:
-                current_price = float(requests.get(f"{FAPI_URL}/fapi/v1/ticker/price",
-                                                    params={'symbol': symbol}, timeout=10).json()['price'])
-            except:
-                continue
-
-            # 初始化/更新监控状态
-            if symbol not in state['positions']:
-                sl_price = round(entry * (1 - _sl) if side == 'LONG' else entry * (1 + _sl), 6)
-                state['positions'][symbol] = {
-                    'entry': entry, 'side': side, 'qty': qty, 'leverage': lev,
-                    'sl_price': sl_price,
-                    'peak_price': max(entry, current_price) if side == 'SHORT' else min(entry, current_price),
-                    'trough_price': current_price if side == 'LONG' else entry,
-                    'sl': _sl, 'tp': _tp,
-                }
-                print(f"[MONITOR] 跟踪 {symbol} {side} x{qty} @ {entry:.6g} | SL@{sl_price:.6g}", file=sys.stderr)
-            else:
-                s = state['positions'][symbol]
-                sl_price = s.get('sl_price')
-                if sl_price is None:
-                    sl_price = round(entry * (1 - _sl) if side == 'LONG' else entry * (1 + _sl), 6)
-                    s['sl_price'] = sl_price
-
-                peak = s.get('peak_price', entry)
-                trough = s.get('trough_price', entry)
-
-                if side == 'SHORT' and current_price > peak:
-                    peak = current_price
-                elif side == 'LONG' and current_price < trough:
-                    trough = current_price
-
-                # 移动止盈检查
-                tp_triggered = False
-                if side == 'SHORT' and trough > 0 and current_price >= trough * (1 + _tp):
-                    tp_triggered = True
-                elif side == 'LONG' and peak > 0 and current_price <= peak * (1 - _tp):
-                    tp_triggered = True
-
-                if tp_triggered:
-                    try:
-                        trader.close_position(symbol, qty)
-                        print(f"[MONITOR] 🟢 移动止盈触发 {symbol} @ {current_price}", file=sys.stderr)
-                        triggered.append(symbol)
-                        state['positions'].pop(symbol, None)
-                    except Exception as e:
-                        print(f"[WARN] 移动止盈平仓失败 {symbol}: {e}", file=sys.stderr)
-                    continue
-
-                # 止损检查
-                sl_triggered = (side == 'SHORT' and current_price >= sl_price) or \
-                               (side == 'LONG' and current_price <= sl_price)
-                if sl_triggered:
-                    try:
-                        trader.close_position(symbol, qty)
-                        print(f"[MONITOR] 🔴 止损触发 {symbol} @ {current_price}", file=sys.stderr)
-                        triggered.append(symbol)
-                        state['positions'].pop(symbol, None)
-                    except Exception as e:
-                        print(f"[WARN] 止损平仓失败 {symbol}: {e}", file=sys.stderr)
-                    continue
-
-                s['peak_price'] = peak
-                s['trough_price'] = trough
-                s['current_price'] = current_price
-                s['qty'] = qty
-
-        # 清理已平仓的记录
-        for sym in list(state['positions'].keys()):
-            if sym not in active_symbols:
-                del state['positions'][sym]
-
-    _save_monitor_state(state)
-    return triggered
-
-
-def _is_pid_alive(pid: int) -> bool:
-    """检查PID是否存活"""
-    import signal
+def _save_conditional_orders(orders: Dict):
+    """保存条件单追踪到文件"""
     try:
-        os.kill(pid, 0)
-        return True
+        with open(_CONDITIONAL_ORDERS_FILE, 'w') as f:
+            json.dump(orders, f, indent=2)
     except:
-        return False
+        pass
 
-def do_monitor(args):
-    """监控命令：常驻循环或单次检查"""
-    import math
-    sl = (args.sl / 100.0) if args.sl is not None else SL_PCT
-    tp = (args.tp / 100.0) if args.tp is not None else TP_PCT
-    interval = getattr(args, 'interval', 5)
-
-    if args.reset:
-        _save_monitor_state({'positions': {}})
-        if os.path.exists(MONITOR_PID_FILE):
-            os.remove(MONITOR_PID_FILE)
-        print("[MONITOR] 状态已重置")
-        return
-
-    if args.once:
-        # 单次检查（用于cron）
-        check_and_trigger_stops()
-        return
-
-    # ---- 常驻前：检查是否已有实例 ----
-    if os.path.exists(MONITOR_PID_FILE):
-        try:
-            old_pid = int(open(MONITOR_PID_FILE).read().strip())
-            if _is_pid_alive(old_pid):
-                print(f"[MONITOR] 已有名为 PID={old_pid} 的实例在运行，退出。\n如需重启请先: kill {old_pid}", file=sys.stderr)
-                return
-            else:
-                print(f"[MONITOR] 发现残留PID文件，进程已不存在，清理中...", file=sys.stderr)
-                os.remove(MONITOR_PID_FILE)
-        except:
-            os.remove(MONITOR_PID_FILE)
-
-    # 写入当前PID
-    with open(MONITOR_PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-
-    print(f"[MONITOR] 启动常驻监控 | 间隔{interval}s | SL={sl*100:.1f}% | TP={tp*100:.1f}% | PID={os.getpid()}", file=sys.stderr)
-    try:
-        while True:
-            check_and_trigger_stops()
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        print(f"\n[MONITOR] 退出", file=sys.stderr)
-    finally:
-        if os.path.exists(MONITOR_PID_FILE):
-            os.remove(MONITOR_PID_FILE)
-
-if SIMULATE:
-    _sim_balance, _sim_positions, _sim_stop_losses = _load_sim_state()
-    print(f"[SIMULATE] 模拟交易模式已启用 (余额: {_sim_balance:.2f} USDT, 持仓: {len(_sim_positions)}个, 止损单: {len(_sim_stop_losses)}个)", file=sys.stderr)
 
 # ========== binance-connector 客户端(用于 PAPI 签名)==========
 sys.path.insert(0, '/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages')
@@ -403,35 +184,242 @@ class BinanceTrader:
             raise Exception(f"fapi Error {r.status_code}: {r.text}")
         return r.json()
 
+    def _papi_sign(self, params: Dict) -> str:
+        """PAPI 签名"""
+        params['timestamp'] = str(int(time.time() * 1000))
+        query = '&'.join([f'{k}={v}' for k, v in sorted(params.items())])
+        return query + '&signature=' + hmac.new(
+            self.api_secret.encode(), query.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _papi_request(self, method: str, endpoint: str, params: Dict = None) -> Dict:
+        """PAPI 签名请求 (PM 统一账户)"""
+        headers = {'X-MBX-APIKEY': self.api_key}
+        if params is None:
+            params = {}
+        signed_params = self._papi_sign(params)
+        url = f"{self.papi_url}{endpoint}?{signed_params}"
+        if method == 'GET':
+            r = requests.get(url, headers=headers, timeout=10)
+        elif method == 'POST':
+            r = requests.post(url, headers=headers, timeout=10)
+        elif method == 'DELETE':
+            r = requests.delete(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            raise Exception(f"papi Error {r.status_code}: {r.text}")
+        return r.json()
+
     # ---- 市场数据(fapi 公开端点)----
     def get_price(self, symbol: str) -> float:
-        r = requests.get(f"{self.fapi_url}/fapi/v1/ticker/price",
-                        params={'symbol': symbol}, timeout=10)
+        try:
+            # 优先用 papi (PM账户可用)，降级用 fapi
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/ticker/price", endpoint='um/ticker/price', params={'symbol': symbol})
+            data = r.json()
+            if 'price' in data:
+                return float(data['price'])
+        except Exception:
+            pass
+        # fapi 降级
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/price", endpoint='ticker/price', params={'symbol': symbol})
         return float(r.json()['price'])
 
     def get_ticker(self, symbol: str) -> Dict:
-        r = requests.get(f"{self.fapi_url}/fapi/v1/ticker/24hr",
-                        params={'symbol': symbol}, timeout=10)
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={'symbol': symbol})
         return r.json()
 
+    def set_stop_loss(self, symbol: str, side: str, quantity: float, trigger_price: float) -> Dict:
+        """PM账户设置止损条件单 (STOP_MARKET - 触发后市价平仓)
+        
+        side: 'SELL'=平多, 'BUY'=平空
+        trigger_price: 触发价格（跌破此价触发）
+        """
+        result = self._papi_request('POST', '/papi/v1/um/algo/order', {
+            'symbol': symbol,
+            'side': side,
+            'algoType': 'CONDITIONAL',
+            'type': 'STOP_MARKET',
+            'quantity': str(quantity),
+            'triggerPrice': str(trigger_price),
+            'reduceOnly': 'true',
+        })
+        # 保存algo_id到文件追踪
+        new_algo_id = result.get('algoId')
+        if new_algo_id:
+            orders = _load_conditional_orders()
+            if symbol not in orders:
+                orders[symbol] = {}
+            orders[symbol][side] = new_algo_id
+            _save_conditional_orders(orders)
+        return result
+
+    def set_stop_loss_limit(self, symbol: str, side: str, quantity: float,
+                            trigger_price: float, order_price: float) -> Dict:
+        """PM账户设置止损条件单 (STOP - 触发后下限价单平仓)
+        
+        side: 'SELL'=平多, 'BUY'=平空
+        trigger_price: 触发价格（跌破此价触发）
+        order_price: 下单价格（通常低于触发价）
+        """
+        return self._papi_request('POST', '/papi/v1/um/algo/order', {
+            'symbol': symbol,
+            'side': side,
+            'algoType': 'CONDITIONAL',
+            'type': 'STOP',
+            'quantity': str(quantity),
+            'stopPrice': str(trigger_price),
+            'price': str(order_price),
+            'reduceOnly': 'true',
+        })
+
+    def set_take_profit(self, symbol: str, side: str, quantity: float, trigger_price: float) -> Dict:
+        """PM账户设置止盈条件单 (TAKE_PROFIT_MARKET - 触发后市价平仓)
+        
+        side: 'SELL'=平多, 'BUY'=平空
+        trigger_price: 触发价格（涨到此价触发）
+        """
+        result = self._papi_request('POST', '/papi/v1/um/algo/order', {
+            'symbol': symbol,
+            'side': side,
+            'algoType': 'CONDITIONAL',
+            'type': 'TAKE_PROFIT_MARKET',
+            'quantity': str(quantity),
+            'triggerPrice': str(trigger_price),
+            'reduceOnly': 'true',
+        })
+        # 保存algo_id到文件追踪
+        new_algo_id = result.get('algoId')
+        if new_algo_id:
+            orders = _load_conditional_orders()
+            if symbol not in orders:
+                orders[symbol] = {}
+            orders[symbol][side] = new_algo_id
+            _save_conditional_orders(orders)
+        return result
+
+    def set_take_profit_limit(self, symbol: str, side: str, quantity: float,
+                              trigger_price: float, order_price: float) -> Dict:
+        """PM账户设置止盈条件单 (TAKE_PROFIT - 触发后上限价单平仓)
+        
+        side: 'SELL'=平多, 'BUY'=平空
+        trigger_price: 触发价格（涨到此价触发）
+        order_price: 下单价格（通常等于或略低于触发价）
+        """
+        return self._papi_request('POST', '/papi/v1/um/algo/order', {
+            'symbol': symbol,
+            'side': side,
+            'algoType': 'CONDITIONAL',
+            'type': 'TAKE_PROFIT',
+            'quantity': str(quantity),
+            'stopPrice': str(trigger_price),
+            'price': str(order_price),
+            'reduceOnly': 'true',
+        })
+
+    def get_conditional_orders(self, symbol: str = None) -> List[Dict]:
+        """查询PM账户活跃条件单（PM账户不支持此接口，始终返回空列表）"""
+        # PM账户 /papi/v1/um/conditional/openOrders 返回 404，无法查询
+        # 使用 .conditional_orders.json 文件追踪活跃条件单
+        return []
+
+    def replace_conditional_order(self, symbol: str, side: str, quantity: int,
+                                   new_trigger_price: float, order_type: str = 'STOP_MARKET',
+                                   algo_id: int = None) -> Dict:
+        """下新的条件单，自动追踪algo_id
+        
+        流程：1)从文件查找旧algo_id 2)尝试取消旧单 3)下新单 4)保存新algo_id
+        
+        Args:
+            symbol: 币种，如 NILUSDT
+            side: 'SELL'=平多仓/'BUY'=平空仓
+            quantity: 数量（整数）
+            new_trigger_price: 新触发价格
+            order_type: 'STOP_MARKET'(止损) / 'TAKE_PROFIT_MARKET'(止盈)
+            algo_id: 可选，直接指定旧条件单ID
+        """
+        # 1. 查找旧algo_id（从文件追踪）
+        orders = _load_conditional_orders()
+        old_algo_id = algo_id
+        if not old_algo_id:
+            old_algo_id = orders.get(symbol, {}).get(side)
+        
+        # 2. 尝试取消旧单
+        if old_algo_id is not None:
+            try:
+                self.cancel_conditional_order(symbol, old_algo_id)
+                print(f"[replace] ✅ 已取消旧条件单 algo_id={old_algo_id}")
+            except Exception as e:
+                print(f"[replace] ⚠️ 取消旧单失败(可能已触发): {e}")
+        
+        # 3. 下新单
+        algo_type_map = {
+            'STOP_MARKET': 'STOP_MARKET',
+            'TAKE_PROFIT_MARKET': 'TAKE_PROFIT_MARKET',
+            'STOP': 'STOP',
+            'TAKE_PROFIT': 'TAKE_PROFIT',
+        }
+        algo_type_val = algo_type_map.get(order_type, 'STOP_MARKET')
+        
+        result = self._papi_request('POST', '/papi/v1/um/algo/order', {
+            'symbol': symbol,
+            'side': side,
+            'algoType': 'CONDITIONAL',
+            'type': algo_type_val,
+            'quantity': str(quantity),
+            'triggerPrice': str(new_trigger_price),
+            'reduceOnly': 'true',
+        })
+        
+        # 4. 保存新algo_id到文件追踪
+        new_algo_id = result.get('algoId')
+        if new_algo_id:
+            orders = _load_conditional_orders()
+            if symbol not in orders:
+                orders[symbol] = {}
+            orders[symbol][side] = new_algo_id
+            _save_conditional_orders(orders)
+            print(f"[replace] ✅ 新条件单已设置 algo_id={new_algo_id}")
+        
+        return result
+
+
+    def _clear_conditional_orders(self, symbol: str):
+        """平仓后清除符号的所有条件单追踪"""
+        orders = _load_conditional_orders()
+        if symbol in orders:
+            del orders[symbol]
+            _save_conditional_orders(orders)
+            print(f"[条件单] 已清除 {symbol} 追踪记录")
+
+    def cancel_conditional_order(self, symbol: str, algo_id: int) -> Dict:
+        """取消PM账户条件单，并清除文件追踪记录"""
+        result = self._papi_request('DELETE', '/papi/v1/um/algo/order', {
+            'symbol': symbol,
+            'algoId': str(algo_id),
+        })
+        # 清除追踪文件中的记录
+        orders = _load_conditional_orders()
+        for sym, sides in orders.items():
+            for side, old_id in list(sides.items()):
+                if str(old_id) == str(algo_id):
+                    del sides[side]
+                    print(f"[cancel] ✅ 已清除追踪记录 symbol={symbol} side={side} algo_id={algo_id}")
+        _save_conditional_orders(orders)
+        return result
+
     def get_klines(self, symbol: str, interval: str = "30m", limit: int = 100) -> List:
-        r = requests.get(f"{self.fapi_url}/fapi/v1/klines",
-                        params={'symbol': symbol, 'interval': interval, 'limit': limit}, timeout=10)
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/klines", endpoint='klines', params={'symbol': symbol, 'interval': interval, 'limit': limit})
         return r.json()
 
     def get_order_book(self, symbol: str, limit: int = 20) -> Dict:
-        r = requests.get(f"{self.fapi_url}/fapi/v1/depth",
-                        params={'symbol': symbol, 'limit': limit}, timeout=10)
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/depth", endpoint='depth', params={'symbol': symbol, 'limit': limit})
         return r.json()
 
     def get_mark_price(self, symbol: str) -> float:
-        r = requests.get(f"{self.fapi_url}/fapi/v1/premiumIndex",
-                        params={'symbol': symbol}, timeout=10)
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/premiumIndex", endpoint='premiumIndex', params={'symbol': symbol})
         return float(r.json()['markPrice'])
 
     def get_funding_rate(self, symbol: str) -> Dict:
-        r = requests.get(f"{self.fapi_url}/fapi/v1/premiumIndex",
-                        params={'symbol': symbol}, timeout=10)
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/premiumIndex", endpoint='premiumIndex', params={'symbol': symbol})
         data = r.json()
         return {
             'fundingRate': float(data.get('lastFundingRate', 0)) * 100,
@@ -440,8 +428,7 @@ class BinanceTrader:
 
     def get_long_short_ratio(self, symbol: str) -> Dict:
         try:
-            r = requests.get(f"{self.fapi_url}/futures/data/globalLongShortRatio",
-                            params={'symbol': symbol, 'periodType': '1h', 'limit': 10}, timeout=10)
+            r = _rl_request('GET', f"{self.fapi_url}/futures/data/globalLongShortRatio", endpoint='globalLongShortRatio', params={'symbol': symbol, 'periodType': '1h', 'limit': 10})
             data = r.json()
             if data:
                 latest = data[-1]
@@ -449,7 +436,7 @@ class BinanceTrader:
                     'longRatio': float(latest.get('longAccount', 0)) * 100,
                     'shortRatio': float(latest.get('shortAccount', 0)) * 100
                 }
-        except:
+        except Exception:
             pass
         return {'longRatio': 50, 'shortRatio': 50}
 
@@ -467,8 +454,7 @@ class BinanceTrader:
             return self.papi.papi_get_account()
         params = {'timestamp': int(time.time()*1000)}
         params['signature'] = self._sign(params)
-        r = requests.get(f"{self.fapi_url}/fapi/v2/account",
-                         headers={'X-MBX-APIKEY': self.api_key}, params=params, timeout=10)
+        r = _rl_request('GET', f"{self.fapi_url}/fapi/v2/account", endpoint='account', headers={'X-MBX-APIKEY': self.api_key}, params=params)
         if r.status_code != 200:
             raise Exception(f"fapi account Error {r.status_code}: {r.text}")
         return r.json()
@@ -476,6 +462,7 @@ class BinanceTrader:
     def get_positions(self, symbol: str = None) -> List[Dict]:
         """获取持仓(PAPI um_position_risk)"""
         if SIMULATE:
+            _load_sim_state()
             result = []
             for s, v in _sim_positions.items():
                 if symbol and s != symbol:
@@ -484,7 +471,9 @@ class BinanceTrader:
                     'symbol': s,
                     'amount': v['qty'],  # 保留小数
                     'entryPrice': v['entry_price'],
-                    'unrealizedProfit': 0.0,
+                    # 模拟模式不连接交易所，unrealizedProfit 无法实时计算
+                # 如需精确浮盈，请使用 SIMULATE=true + trader.py status 获取快照
+                    'unrealizedProfit': None,
                     'leverage': v.get('leverage', 3),
                     'positionSide': v.get('side', 'LONG'),
                     'margin': v.get('margin', 0)
@@ -504,7 +493,7 @@ class BinanceTrader:
                         'symbol': pos['symbol'],
                         'amount': abs(amt),  # 保留小数精度,平仓时再取整
                         'entryPrice': float(pos.get('entryPrice', 0)),
-                        'unrealizedProfit': float(pos.get('unrealizedPL', 0)),
+                        'unrealizedProfit': float(pos.get('unRealizedProfit', 0)),
                         'leverage': int(pos.get('leverage', 1)),
                         'positionSide': 'SHORT' if amt < 0 else 'LONG'
                     })
@@ -531,6 +520,7 @@ class BinanceTrader:
     def get_usdt_balance(self) -> float:
         """获取USDT余额"""
         if SIMULATE:
+            _load_sim_state()
             return _sim_balance
         if is_portfolio_margin():
             account = self.papi.papi_get_account()
@@ -546,6 +536,48 @@ class BinanceTrader:
 
     def close_position(self, symbol: str, quantity: float = None) -> Dict:
         """平仓（通用：多头用SELL，空头用BUY）"""
+        global _sim_balance, _sim_positions
+        if SIMULATE and not _sim_positions:
+            _load_sim_state()
+        if SIMULATE:
+            if symbol not in _sim_positions:
+                raise Exception(f"[SIMULATE] 无持仓: {symbol}")
+            pos = _sim_positions[symbol]
+            price = pos['entry_price']  # 用入场价
+            qty = pos['qty']
+            side = pos.get('side', 'LONG')
+            try:
+                klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
+                                      params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
+                price = float(klines[0][4])
+            except Exception:
+                pass
+            if side == 'SHORT':
+                pnl = (pos['entry_price'] - price) * qty
+            else:
+                pnl = (price - pos['entry_price']) * qty
+            close_fee = qty * price * 0.001
+            net_pnl = pnl - close_fee
+            _sim_balance += net_pnl
+            del _sim_positions[symbol]
+            _save_sim_state(_sim_balance, _sim_positions)
+            print(f"[SIMULATE] 平仓 {symbol} x{qty:.4f} @ {price}, 盈亏={net_pnl:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
+            return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'SELL' if side == 'LONG' else 'BUY', 'origQty': str(qty), 'pnl': net_pnl, 'margin': pos['margin']}
+        if is_portfolio_margin():
+            import math
+            positions = self.get_positions(symbol)
+            if not positions:
+                raise Exception(f"无持仓: {symbol}")
+            pos = positions[0]
+            if quantity is None:
+                quantity = abs(pos['amount'])
+            qty_int = max(1, math.ceil(quantity))
+            return self.papi.papi_create_um_order(
+                symbol=symbol,
+                side='SELL' if pos['positionSide'] == 'LONG' else 'BUY',
+                type='MARKET',
+                quantity=qty_int
+            )
         import math
         positions = self.get_positions(symbol)
         if not positions:
@@ -553,14 +585,7 @@ class BinanceTrader:
         pos = positions[0]
         if quantity is None:
             quantity = abs(pos['amount'])
-        qty_int = max(1, math.floor(quantity))
-        if is_portfolio_margin():
-            return self.papi.papi_create_um_order(
-                symbol=symbol,
-                side='SELL' if pos['positionSide'] == 'LONG' else 'BUY',
-                type='MARKET',
-                quantity=qty_int
-            )
+        qty_int = max(1, math.ceil(quantity))
         params = {
             'symbol': symbol,
             'side': 'BUY' if pos['positionSide'] == 'SHORT' else 'SELL',
@@ -593,7 +618,7 @@ class BinanceTrader:
 
 # ========== BinanceTrader 交易方法(做空/做多)==========
     def open_short(self, symbol: str, quantity: float, leverage: int = 10,
-                   sl_pct: float = SL_PCT, tp_pct: float = TP_PCT) -> Dict:
+                   ) -> Dict:
         """开空仓(PAPI um_order,单向模式:side=SELL 无需positionSide)"""
         if SIMULATE:
             global _sim_balance, _sim_positions
@@ -602,7 +627,7 @@ class BinanceTrader:
                 klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
                                       params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
                 price = float(klines[0][4])
-            except:
+            except Exception:
                 price = 0.001
             # 保证金模型: 使用80%余额作为保证金的上限
             available_margin = _sim_balance * 0.8
@@ -618,11 +643,9 @@ class BinanceTrader:
                 position_value = qty * price
                 margin = position_value / leverage
             fee = position_value * 0.001  # 0.1% 开仓手续费
-            _sim_positions[symbol] = {'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'SHORT', 'peak_price': price, 'trough_price': price}
-            # 自动设置止损:做空 → 价格涨到 entry*(1+SL_PCT) 触发
-            _sim_stop_losses[symbol] = price * (1 + SL_PCT)
+            _sim_positions[symbol] = {'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'SHORT', }
             _sim_balance -= (margin + fee)  # 扣除保证金和手续费
-            _save_sim_state(_sim_balance, _sim_positions, _sim_stop_losses)  # 持久化
+            _save_sim_state(_sim_balance, _sim_positions)
             print(f"[SIMULATE] 开空 {symbol} x{qty:.4f} @ {price}, 保证金={margin:.2f} USDT, 手续费={fee:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'SELL', 'origQty': str(qty), 'margin': margin}
         try:
@@ -663,7 +686,7 @@ class BinanceTrader:
         return result
 
     def open_long(self, symbol: str, quantity: float, leverage: int = 10,
-                  sl_pct: float = SL_PCT, tp_pct: float = TP_PCT) -> Dict:
+                  ) -> Dict:
         """开多仓(PAPI um_order,单向模式:side=BUY 开多)"""
         if SIMULATE:
             global _sim_balance, _sim_positions
@@ -671,7 +694,7 @@ class BinanceTrader:
                 klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
                                       params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
                 price = float(klines[0][4])
-            except:
+            except Exception:
                 price = 0.001
             available_margin = _sim_balance * 0.8
             qty = max(quantity, 1)
@@ -684,11 +707,9 @@ class BinanceTrader:
                 position_value = qty * price
                 margin = position_value / leverage
             fee = position_value * 0.001
-            _sim_positions[symbol] = {'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'LONG', 'peak_price': price, 'trough_price': price}
-            # 自动设置止损:做多 → 价格跌到 entry*(1-SL_PCT) 触发
-            _sim_stop_losses[symbol] = price * (1 - SL_PCT)
+            _sim_positions[symbol] = {'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'LONG', }
             _sim_balance -= (margin + fee)
-            _save_sim_state(_sim_balance, _sim_positions, _sim_stop_losses)
+            _save_sim_state(_sim_balance, _sim_positions)
             print(f"[SIMULATE] 开多 {symbol} x{qty:.4f} @ {price}, 保证金={margin:.2f} USDT, 手续费={fee:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'BUY', 'origQty': str(qty), 'margin': margin}
         try:
@@ -727,54 +748,64 @@ class BinanceTrader:
         result = r.json()
         return result
 
+
+    # get_position_mode 已删除 — fapi接口不可用，PM账户用单向持仓无需查询
+
+
+
     def close_long(self, symbol: str, quantity: float = None) -> Dict:
-        """平多仓(PAPI um_order,单向模式:side=SELL 平多)"""
-        if quantity is None:
-            positions = self.get_positions(symbol)
-            for pos in positions:
-                if pos.get('positionSide') == 'LONG' or (pos['amount'] > 0):
-                    quantity = abs(pos['amount'])
-                    break
-        if quantity is None or quantity <= 0:
-            raise Exception(f"No long position found for {symbol}")
-
-        # PM 要求整数,用 math.floor 保留精度
-        import math
-        qty_int = math.floor(quantity)
-        if qty_int == 0:
-            qty_int = 1
-
+        """平多仓 — 只接受LONG持仓(PAPI/fapi)"""
         if SIMULATE:
             global _sim_balance, _sim_positions
-            if symbol not in _sim_positions:
-                raise Exception(f"[SIMULATE] 无持仓: {symbol}")
+            _load_sim_state()
+            if symbol not in _sim_positions or _sim_positions[symbol].get('side') != 'LONG':
+                raise Exception(f"[SIMULATE] No LONG position found for {symbol}")
             pos = _sim_positions[symbol]
             entry = pos['entry_price']
             margin = pos['margin']
-            lev = pos['leverage']
             qty = pos['qty']
             try:
                 klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
                                       params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
                 price = float(klines[0][4])
-            except:
+            except Exception:
                 price = entry
-            pnl = (price - entry) * qty * lev
-            close_fee = (qty * price) * 0.001
+            pnl = (price - entry) * qty
+            close_fee = qty * price * 0.001
             net_pnl = pnl - close_fee
-            _sim_balance += margin + net_pnl
+            _sim_balance += net_pnl
             del _sim_positions[symbol]
-            _sim_stop_losses.pop(symbol, None)
-            _save_sim_state(_sim_balance, _sim_positions, _sim_stop_losses)
+            _save_sim_state(_sim_balance, _sim_positions)
             print(f"[SIMULATE] 平多 {symbol} x{qty:.4f} @ {price}, 盈亏={net_pnl:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'SELL', 'origQty': str(qty), 'pnl': net_pnl, 'margin': margin}
+
+        positions = self.get_positions(symbol)
+        has_long = any(pos.get('positionSide') == 'LONG' or pos['amount'] > 0 for pos in positions)
+        if not has_long:
+            raise Exception(f"No LONG position found for {symbol}")
+
+        if quantity is None:
+            for pos in positions:
+                if pos.get('positionSide') == 'LONG' or pos['amount'] > 0:
+                    quantity = abs(pos['amount'])
+                    break
+        if quantity is None or quantity <= 0:
+            raise Exception(f"No LONG position found for {symbol}")
+
+        import math
+        qty_int = math.floor(quantity)
+        if qty_int == 0:
+            qty_int = 1
+
         if is_portfolio_margin():
-            return self.papi.papi_create_um_order(
+            result = self.papi.papi_create_um_order(
                 symbol=symbol,
                 side='SELL',
                 type='MARKET',
                 quantity=qty_int
             )
+            self._clear_conditional_orders(symbol)
+            return result
         params = {
             'symbol': symbol,
             'side': 'SELL',
@@ -789,85 +820,6 @@ class BinanceTrader:
         if r.status_code != 200:
             raise Exception(f"close_long Error {r.status_code}: {r.text}")
         return r.json()
-
-    def close_short(self, symbol: str, quantity: float = None) -> Dict:
-        """平空仓(PAPI um_order,单向模式:side=BUY 平空)"""
-        if quantity is None:
-            positions = self.get_positions(symbol)
-            for pos in positions:
-                # PM账户amount取绝对值,用positionSide判断
-                if pos.get('positionSide') == 'SHORT' or (pos['amount'] < 0):
-                    quantity = abs(pos['amount'])
-                    break
-        if quantity is None or quantity <= 0:
-            raise Exception(f"No short position found for {symbol}")
-
-        # PM 要求整数,用 math.floor 保留精度
-        import math
-        qty_int = math.floor(quantity)
-        if qty_int == 0:
-            qty_int = 1
-
-        if SIMULATE:
-            global _sim_balance, _sim_positions
-            if symbol not in _sim_positions:
-                raise Exception(f"[SIMULATE] 无持仓: {symbol}")
-            pos = _sim_positions[symbol]
-            entry = pos['entry_price']
-            margin = pos['margin']
-            lev = pos['leverage']
-            qty = pos['qty']  # 使用持仓中的数量(可能是小数)
-            try:
-                klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
-                                      params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
-                price = float(klines[0][4])
-            except:
-                price = entry
-            # 空仓盈亏: (开仓价 - 平仓价) × 数量 × 杠杆
-            pnl = (entry - price) * qty * lev
-            close_fee = (qty * price) * 0.001  # 平仓手续费
-            net_pnl = pnl - close_fee
-            _sim_balance += margin + net_pnl  # 退回保证金 + 盈亏 - 平仓费
-            del _sim_positions[symbol]
-            _sim_stop_losses.pop(symbol, None)
-            _save_sim_state(_sim_balance, _sim_positions, _sim_stop_losses)  # 持久化
-            print(f"[SIMULATE] 平空 {symbol} x{qty:.4f} @ {price}, 盈亏={net_pnl:.4f} USDT (PnL={pnl:.4f}, 平仓费={close_fee:.4f}), 余额={_sim_balance:.4f}", file=sys.stderr)
-            return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'BUY', 'origQty': str(qty), 'pnl': net_pnl, 'margin': margin}
-        if is_portfolio_margin():
-            # 单向模式:side=BUY 平空
-            return self.papi.papi_create_um_order(
-                symbol=symbol,
-                side='BUY',
-                type='MARKET',
-                quantity=qty_int
-            )
-        params = {
-            'symbol': symbol,
-            'side': 'BUY',
-            'positionSide': 'SHORT',
-            'type': 'MARKET',
-            'quantity': quantity,
-            'timestamp': int(time.time()*1000)
-        }
-        params['signature'] = self._sign(params)
-        r = requests.post(f"{self.fapi_url}/fapi/v1/order",
-                          headers={'X-MBX-APIKEY': self.api_key}, params=params, timeout=10)
-        if r.status_code != 200:
-            raise Exception(f"close_short Error {r.status_code}: {r.text}")
-        return r.json()
-
-    def get_position_mode(self) -> Dict:
-        """获取持仓模式"""
-        if is_portfolio_margin():
-            return self.papi.papi_get_um_position_side_dual()
-        params = {'timestamp': int(time.time()*1000)}
-        params['signature'] = self._sign(params)
-        r = requests.get(f"{self.fapi_url}/fapi/v1/positionSide/dual",
-                         headers={'X-MBX-APIKEY': self.api_key}, params=params, timeout=10)
-        if r.status_code != 200:
-            raise Exception(f"positionMode Error {r.status_code}: {r.text}")
-        return r.json()
-
 # ========== 技术指标计算 ==========
 class TechnicalIndicators:
     @staticmethod
@@ -909,16 +861,10 @@ class TechnicalIndicators:
         ema26 = ema(prices, 26)
         macd_line = ema12 - ema26
 
-        # Signal线 (EMA9 of MACD)
-        # 简化计算
-        signal = macd_line * 0.9  # 近似
-
-        histogram = macd_line - signal
+        macd_line = ema12 - ema26
 
         return {
             'macd': round(macd_line, 4),
-            'signal': round(signal, 4),
-            'histogram': round(histogram, 4)
         }
 
     @staticmethod
@@ -1017,7 +963,7 @@ def get_recent_highs(symbol: str, periods: List[int] = [7, 30]) -> Dict:
                 pct_from_high = ((current - recent_high) / recent_high * 100) if recent_high > 0 else 0
                 result[f'{days}d_high'] = round(recent_high, 6)
                 result[f'{days}d_pct'] = round(pct_from_high, 3)
-        except:
+        except Exception:
             result[f'{days}d_high'] = 0
             result[f'{days}d_pct'] = 0
     return result
@@ -1139,7 +1085,7 @@ def format_for_llm(symbol: str, action: str = "open") -> str:
                 timeout=10
             )
             result[interval] = r.json()
-        except:
+        except Exception:
             result[interval] = []
 
     lines = [f"# {symbol} {'开仓' if action == 'open' else '持仓'}分析", ""]
@@ -1235,7 +1181,7 @@ def _fetch_klines_multi(symbol: str, intervals: List[str] = None) -> Dict:
             data = r.json()
             if isinstance(data, list):
                 return interval, data
-        except:
+        except Exception:
             pass
         return interval, []
 
@@ -1271,7 +1217,7 @@ def scan_short_candidates(min_change: float = 10) -> List[Dict]:
     print(f"📈 做空候选扫描(涨幅 >= {min_change}%,多线程拉K线)")
     print(f"{'='*60}")
 
-    r = requests.get(f"{FAPI_URL}/fapi/v1/ticker/24hr", params={"limit": 500}, timeout=30)
+    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 500})
     all_tickers = r.json()
 
     usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
@@ -1328,7 +1274,7 @@ def scan_short_candidates(min_change: float = 10) -> List[Dict]:
 
 def get_all_perpetual_symbols() -> List[str]:
     """获取所有USDT永续合约"""
-    r = requests.get(f"{FAPI_URL}/fapi/v1/exchangeInfo", timeout=10)
+    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo')
     data = r.json()
 
     symbols = []
@@ -1439,7 +1385,7 @@ def scan_long_candidates(min_change: float = -10, max_change: float = -3) -> Lis
     print(f"📉 做多候选扫描(跌幅 {max_change}% ~ {min_change}%,多线程拉K线)")
     print(f"{'='*60}")
 
-    r = requests.get(f"{FAPI_URL}/fapi/v1/ticker/24hr", params={"limit": 500}, timeout=30)
+    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 500})
     all_tickers = r.json()
 
     usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
@@ -1504,7 +1450,7 @@ def scan_candidates(min_change: float = 10) -> List[Dict]:
     print(f"🔍 扫描候选币种(涨幅 >= {min_change}%,只分析10个)")
     print(f"{'='*60}")
 
-    r = requests.get(f"{FAPI_URL}/fapi/v1/ticker/24hr", params={"limit": 10}, timeout=30)
+    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 10})
     all_tickers = r.json()
     print(f"总币种数: {len(all_tickers)}")
 
@@ -1531,18 +1477,109 @@ def scan_candidates(min_change: float = 10) -> List[Dict]:
 
 # ========== 统一波动率扫描(多空一起获取)==========
 
-# 速率限制:防止IP被封
-_REQUEST_INTERVAL = 0.1  # 每次请求间隔(秒),币安限制约1200/分钟
-_last_request_time = 0
+# ========== 速率限制 ==========
+# Binance Futures API Rate Limits (futures/usdel撮合):
+#   - 1200 weight / minute (REQUEST + ORDER combined)
+#   - 2400 weight / minute (READ endpoint)
+#   - 60 weight / second burst
+# Reference: https://developers.binance.net/docs/rate-limits
+
+_WEIGHT_CONFIG = {
+    # Endpoint : (weight,  per_second_burst)
+    'ticker/24hr':       (40,  5),   # 40w, ~30/s
+    'ticker/price':      (2,   20),  # 2w
+    'exchangeInfo':      (10,  45),  # 10w
+    'klines':            (5,   120), # 5w per symbol+interval per request
+    'depth':             (5,   120), # 5w
+    'premiumIndex':       (5,   120), # funding rate / mark price
+    'account':           (10,  45),
+    'um_position_risk':  (5,   120),
+    'um_order':          (5,   120),
+    'default':            (5,   120),
+}
+
+class RateLimiter:
+    """滑动窗口速率限制器 — 按权重计数"""
+    def __init__(self, max_weight_per_sec: int = 60, max_weight_per_min: int = 1200):
+        self.max_weight_per_sec = max_weight_per_sec
+        self.max_weight_per_min = max_weight_per_min
+        self._sec_timestamps = []  # [timestamp, ...] last-second window
+        self._min_timestamps = []  # [timestamp, ...] last-minute window
+        self._lock = __import__('threading').Lock()
+
+    def acquire(self, weight: int, wait: bool = True, timeout: float = 30.0) -> bool:
+        """请求 weight 单位，必要时阻塞等待配额返回"""
+        start = time.time()
+        while True:
+            with self._lock:
+                now = time.time()
+                # 清理过期戳 (timestamps = list of (time, weight))
+                self._sec_timestamps = [(t, w) for t, w in self._sec_timestamps if now - t < 1.0]
+                self._min_timestamps = [(t, w) for t, w in self._min_timestamps if now - t < 60.0]
+                sec_w = sum(w for _, w in self._sec_timestamps)
+                min_w = sum(w for _, w in self._min_timestamps)
+                if (sec_w + weight <= self.max_weight_per_sec and
+                    min_w + weight <= self.max_weight_per_min):
+                    self._sec_timestamps.append((now, weight))
+                    self._min_timestamps.append((now, weight))
+                    return True
+            if not wait:
+                return False
+            # 等待最近一个请求过期（优先等秒级）
+            with self._lock:
+                if self._sec_timestamps:
+                    oldest_sec = min(t for t, _ in self._sec_timestamps)
+                    sleep_sec = 1.0 - (now - oldest_sec)
+                elif self._min_timestamps:
+                    oldest_min = min(t for t, _ in self._min_timestamps)
+                    sleep_sec = 60.0 - (now - oldest_min)
+                else:
+                    sleep_sec = 0.05
+            sleep_sec = max(0.01, min(sleep_sec, timeout - (time.time() - start)))
+            if sleep_sec <= 0:
+                break
+            time.sleep(sleep_sec)
+            if time.time() - start > timeout:
+                return False
+        return False
+
+    def remaining(self) -> tuple:
+        """返回 (sec_remaining, min_remaining) 权重配额"""
+        with self._lock:
+            now = time.time()
+            sec_w = sum(w for t, w in self._sec_timestamps if now - t < 1.0)
+            min_w = sum(w for t, w in self._min_timestamps if now - t < 60.0)
+            return (max(0, self.max_weight_per_sec - sec_w),
+                    max(0, self.max_weight_per_min - min_w))
+
+
+_rl = RateLimiter()
+
+
+def _binance_weight(endpoint: str, method: str = 'GET') -> int:
+    """根据 endpoint 估算请求权重"""
+    ep = endpoint.strip('/').split('/')[-1]  # e.g. 'fapi/v1/klines' -> 'klines'
+    for key in _WEIGHT_CONFIG:
+        if key in ep:
+            return _WEIGHT_CONFIG[key][0]
+    return _WEIGHT_CONFIG['default'][0]
+
+
+def _rl_request(method: str, url: str, endpoint: str = '', **kwargs) -> requests.Response:
+    """带速率限制的 requests 封装 — 自动扣权重"""
+    weight = _binance_weight(endpoint or url)
+    # READ 超时较长
+    kwargs.setdefault('timeout', 30 if method == 'GET' else 10)
+    if not _rl.acquire(weight, wait=True, timeout=30.0):
+        raise Exception(f"Rate limit timeout after 30s (weight={weight}) for {endpoint or url}")
+    r = requests.request(method, url, **kwargs)
+    return r
+
 
 def _rate_limit():
-    """简单速率限制"""
-    global _last_request_time
-    now = time.time()
-    elapsed = now - _last_request_time
-    if elapsed < _REQUEST_INTERVAL:
-        time.sleep(_REQUEST_INTERVAL - elapsed)
-    _last_request_time = time.time()
+    """旧兼容函数 — 扣1个默认权重"""
+    _rl.acquire(_WEIGHT_CONFIG['default'][0])
+
 
 def _get_klines_raw(symbol: str, interval: str, limit: int) -> List:
     """Get raw klines without computing indicators (with retry)"""
@@ -1644,7 +1681,7 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
 
     # 获取可交易币种(只取 TRADING 状态)
     _rate_limit()
-    r = requests.get(f"{FAPI_URL}/fapi/v1/exchangeInfo", timeout=10)
+    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo')
     exchange_info = r.json()
     tradeable_symbols = set()
     for s in exchange_info.get('symbols', []):
@@ -1661,13 +1698,59 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
 
     # 获取24h行情
     _rate_limit()
-    r = requests.get(
-        f"{FAPI_URL}/fapi/v1/ticker/24hr",
-        params={"limit": top_n * 3, "sortBy": "priceChangePercent", "sortType": "DESC"},
-        timeout=30
-    )
-    all_tickers: List[Dict] = r.json()
-    usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
+    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": top_n * 3, "sortBy": "priceChangePercent", "sortType": "DESC"})
+    all_tickers_raw = r.json()
+    # 处理正常响应(list)或rate limit错误(dict)
+    if isinstance(all_tickers_raw, dict) and all_tickers_raw.get('code') == -1003:
+        print(f"⚠️ Binance 24hr API 速率限制，切换到本地排序模式")
+        # 回退：获取全部24hr数据用本地Python排序
+        _rate_limit()
+        r2 = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200})
+        all_tickers = r2.json()
+        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+            print(f"⚠️ Binance API 全面受限，等待60秒后重试")
+            time.sleep(60)
+            r2 = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200})
+            all_tickers = r2.json()
+        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+            print(f"⚠️ Binance API 仍然受限，尝试 PAPI 末端...")
+            _rate_limit()
+            try:
+                r3 = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={"limit": 200})
+                papi_data = r3.json()
+                if isinstance(papi_data, list):
+                    all_tickers = papi_data
+                    print(f"⚠️ PAPI 末端成功，获取 {len(papi_data)} 条")
+            except Exception as e:
+                print(f"⚠️ PAPI 也失败: {e}")
+        # 最终检查
+        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+            print(f"⚠️ 所有API均受限，尝试用 exchangeInfo + klines 备选方案...")
+            # 备选：直接从各币种K线数据获取价格信息
+            _rate_limit()
+            try:
+                # 获取 BTCUSDT 价格作为市场参考
+                btc_r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/price", endpoint='ticker/price', params={"symbol": "BTCUSDT"})
+                btc_data = btc_r.json()
+                if isinstance(btc_data, dict) and btc_data.get('symbol'):
+                    # 用 BTC 涨幅近似市场情绪
+                    btc_change = 0.0
+                else:
+                    btc_change = 0.0
+            except:
+                btc_change = 0.0
+            print(f"⚠️ API 受限期间无法获取完整市场数据，请稍后重试")
+            print(f"当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}，Binance 限制可能持续 1-2 分钟")
+            # 返回空结果，程序会优雅退出
+            candidates = []
+            return candidates
+        usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
+        # 本地按涨幅排序
+        usdt_pairs.sort(key=lambda x: float(x.get('priceChangePercent', 0) or 0), reverse=True)
+        usdt_pairs = usdt_pairs[:top_n * 3]
+    else:
+        all_tickers = all_tickers_raw
+        usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
     print(f"Binance sorted: {len(usdt_pairs)} candidates")
 
     candidates = []
@@ -1752,33 +1835,34 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
             c['llm_reason'] = 'LLM no output'
             c['confidence'] = 0
 
-def get_market_data(symbol: str, kline_count: int = 5) -> Dict:
-    """获取市场数据"""
+    return candidates
+
+def get_market_data(symbol: str, kline_count: int = 15) -> Dict:
+    """获取市场数据 - 多周期K线格式"""
     trader = BinanceTrader()
 
-    # K线数据
-    klines = trader.get_klines(symbol, "30m", limit=100)
+    # 多周期K线数据 - 需要足够数据计算指标
+    intervals = {'5m': 100, '30m': 100, '1h': 100, '4h': 100}
+    klines_data = {}
+    for iv_name, iv_min in intervals.items():
+        klines_data[iv_name] = trader.get_klines(symbol, iv_name, limit=100)
 
     # 提取价格数据
-    closes = [float(k[4]) for k in klines]
-    highs = [float(k[2]) for k in klines]
-    lows = [float(k[3]) for k in klines]
-    volumes = [float(k[5]) for k in klines]
+    closes = [float(k[4]) for k in klines_data['30m']]
+    highs = [float(k[2]) for k in klines_data['30m']]
+    lows = [float(k[3]) for k in klines_data['30m']]
+    volumes = [float(k[5]) for k in klines_data['30m']]
 
     # 技术指标
     rsi = TechnicalIndicators.calculate_rsi(closes)
     macd = TechnicalIndicators.calculate_macd(closes)
     bb = TechnicalIndicators.calculate_bollinger_bands(closes)
-    atr = TechnicalIndicators.calculate_atr(klines)
-
-    # MA
+    atr = TechnicalIndicators.calculate_atr(klines_data['30m'])
     ma5 = TechnicalIndicators.calculate_ma(closes, 5)
     ma20 = TechnicalIndicators.calculate_ma(closes, 20)
 
     # 最新价格
     current_price = closes[-1]
-
-    # ATR百分比
     atr_percent = (atr / current_price * 100) if current_price > 0 else 0
 
     # 成交量变化
@@ -1803,7 +1887,7 @@ def get_market_data(symbol: str, kline_count: int = 5) -> Dict:
         'symbol': symbol,
         'current_price': current_price,
         'change_24h': float(trader.get_ticker(symbol).get('priceChangePercent', 0)),
-        'klines': klines[-kline_count:],
+        'klines_data': klines_data,
         'rsi': rsi,
         'macd': macd,
         'bollinger': bb,
@@ -1815,27 +1899,52 @@ def get_market_data(symbol: str, kline_count: int = 5) -> Dict:
         'funding_rate': funding_rate,
         'long_ratio': ls_ratio.get('longRatio', 50),
         'short_ratio': ls_ratio.get('shortRatio', 50),
-        'closes': closes,
-        'highs': highs,
-        'lows': lows,
-        'volumes': volumes
     }
 
+def _format_klines_for_market(klines: List, interval: str) -> str:
+    """Format klines for market command - matches scan-all format"""
+    lines = []
+    if not klines:
+        return ""
+    lines.append(f"## {interval} ({len(klines)} bars)")
+    closes = [float(k[4]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    current = closes[-1]
+    period_high = max(highs)
+    period_low = min(lows)
+    pct_from_high = ((current - period_high) / period_high * 100) if period_high > 0 else 0
+    pct_from_low = ((current - period_low) / period_low * 100) if period_low > 0 else 0
+    lines.append(f"Current: {current:.6f} | Period High: {period_high:.6f}({pct_from_high:+.1f}%) | Period Low: {period_low:.6f}({pct_from_low:+.1f}%)")
+    lines.append("")
+    for k in klines[-15:]:
+        ts = k[0] / 1000
+        dt = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
+        o = float(k[1]); c = float(k[4]); h = float(k[2]); l = float(k[3]); v = float(k[5])
+        chg = (c - o) / o * 100 if o > 0 else 0
+        body = "UP" if c > o else "DOWN"
+        upper_shadow = h - max(o, c)
+        lower_shadow = min(o, c) - l
+        lines.append(f"  {dt} O:{o:.5f} C:{c:.5f} H:{h:.5f} L:{l:.5f} {body}{chg:+.2f}% U:{upper_shadow:.5f} L:{lower_shadow:.5f} V:{v:.0f}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def print_market_data(data: Dict):
-    """打印市场数据"""
+    """打印市场数据 - scan-all格式"""
     print(f"\n{'='*60}")
     print(f"📊 {data['symbol']} 市场数据")
     print(f"{'='*60}")
     print(f"当前价格: ${data['current_price']:.4f}")
-    print(f"24h涨幅: +{data['change_24h']:.2f}%")
+    sign = '+' if data['change_24h'] >= 0 else ''
+    print(f"24h涨幅: {sign}{data['change_24h']:.2f}%")
     print()
     print(f"【技术指标】")
-    print(f"  RSI(14):     {data['rsi']}")
-    print(f"  MACD:        {data['macd']}")
-    print(f"  Signal:      {data['macd']['signal']}")
+    print(f"  RSI(14):     {data['rsi']:.2f}")
+    print(f"  MACD:        macd={data['macd']['macd']:.4f} signal={data['macd']['signal']:.4f} hist={data['macd']['histogram']:.4f}")
     print(f"  布林带:      上 ${data['bollinger']['upper']:.2f} / 中 ${data['bollinger']['middle']:.2f} / 下 ${data['bollinger']['lower']:.2f}")
     print(f"  位置:        {data['bollinger']['position']:.1f}%")
-    print(f"  ATR:         {data['atr']} ({data['atr_percent']}%)")
+    print(f"  ATR:         {data['atr']:.2f} ({data['atr_percent']}%)")
     print(f"  MA5:         ${data['ma5']}")
     print(f"  MA20:        ${data['ma20']}")
     print()
@@ -1848,49 +1957,15 @@ def print_market_data(data: Dict):
     print(f"  空头比例:    {data['short_ratio']:.1f}%")
     print()
 
-    # K线形态
-    print(f"【K线形态】(最近5根)")
-    klines = data['klines']
-    for i, k in enumerate(klines):
-        ts = datetime.fromtimestamp(k[0]/1000).strftime('%H:%M')
-        o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
-        v = float(k[5])
-
-        # 判断涨跌
-        change = c - o
-        if change > 0:
-            color = '🟢'
-        elif change < 0:
-            color = '🔴'
-        else:
-            color = '⚪'
-
-        # 上下影线
-        upper_shadow = h - max(o, c)
-        lower_shadow = min(o, c) - l
-        body = abs(change)
-
-        # 形态判断
-        pattern = ""
-        if upper_shadow > body * 0.5:
-            pattern += "上影长 "
-        if lower_shadow > body * 0.5:
-            pattern += "下影长 "
-        if upper_shadow > body and lower_shadow > body:
-            pattern += "十字星 "
-        if i > 0:
-            prev_c = float(klines[i-1][4])
-            if c < prev_c and c < o:
-                pattern += "下跌 "
-
-        print(f"  {i+1}. {ts} {color} 开:{o:.2f} 高:{h:.2f} 低:{l:.2f} 收:{c:.2f} 量:{v:.0f} {pattern}")
+    # 多周期K线 - 与scan-all一致格式
+    for interval, key in [('5m', '5m'), ('30m', '30m'), ('1h', '1h'), ('4h', '4h')]:
+        kls = data['klines_data'].get(key, [])
+        if kls:
+            print(_format_klines_for_market(kls, interval))
 
 def get_status(symbol: str = None) -> Dict:
     """获取账户状态"""
     trader = BinanceTrader()
-
-    # 检查止损触发(模拟模式)
-    check_and_trigger_stops()
 
     balance = trader.get_usdt_balance()
     positions = trader.get_positions(symbol)
@@ -1912,7 +1987,11 @@ def get_status(symbol: str = None) -> Dict:
             print(f"  币种: {pos['symbol']}")
             print(f"  数量: {pos['amount']}")
             print(f"  开仓价: ${pos['entryPrice']:.4f}")
-            print(f"  未实现盈亏: ${pos['unrealizedProfit']:.2f}")
+            pnl = pos.get('unrealizedProfit')
+            if pnl is not None:
+                print(f"  未实现盈亏: ${pnl:.2f}")
+            else:
+                print(f"  未实现盈亏: $0.00")
             print(f"  杠杆: {pos['leverage']}x")
             print(f"  方向: {pos['positionSide']}")
     else:
@@ -1920,19 +1999,17 @@ def get_status(symbol: str = None) -> Dict:
 
     return result
 
-def do_open_short(symbol: str, margin: float, leverage: int, sl_pct: float = None, tp_pct: float = None) -> Dict:
+def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     """开空仓"""
-    sl = (sl_pct / 100.0) if sl_pct is not None else SL_PCT
-    tp = (tp_pct / 100.0) if tp_pct is not None else TP_PCT
     trader = BinanceTrader()
 
     # 获取当前价格
     price = trader.get_price(symbol)
 
     # 获取数量精度
-    step_size = 1
+    step_size = None
     try:
-        r = requests.get(f"{FAPI_URL}/fapi/v1/exchangeInfo", timeout=10)
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo')
         for s in r.json().get('symbols', []):
             if s['symbol'] == symbol:
                 for f in s.get('filters', []):
@@ -1940,14 +2017,17 @@ def do_open_short(symbol: str, margin: float, leverage: int, sl_pct: float = Non
                         step_size = float(f['stepSize'])
                         break
                 break
-    except:
+    except Exception:
         pass
 
     # 计算开仓数量(round 到 stepSize 的整数倍)
     quantity = (margin * leverage) / price
-    quantity = round(round(quantity / step_size) * step_size, 8)  # 保留精度
+    if step_size and step_size > 0:
+        quantity = round(round(quantity / step_size) * step_size, 8)
+    else:
+        quantity = round(quantity, 8)  # 无法获取step_size时，保留8位小数
     if quantity <= 0:
-        quantity = step_size
+        quantity = 0.00000001
 
     print(f"\n{'='*60}")
     print(f"🔴 开空仓: {symbol}")
@@ -1958,13 +2038,21 @@ def do_open_short(symbol: str, margin: float, leverage: int, sl_pct: float = Non
     print(f"数量: {quantity}")
     print()
 
-    result = trader.open_short(symbol, quantity, leverage, sl, tp)
+    result = trader.open_short(symbol, quantity, leverage)
     print(f"订单结果: {json.dumps(result, indent=2)}")
     # 判断是否成功
     if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
         print(f"\n✅ 开空仓成功")
-        # 立即将持仓注册到监控状态（使用开仓时指定的sl/tp）
-        check_and_trigger_stops(sl_pct, tp_pct)
+        # ===== 自动设置止损（杠杆前1%，止盈由LLM设置）=====
+        import math
+        qty_int = max(1, math.ceil(quantity))
+        sl_trigger = round(price * 1.02, 6)   # 止损: 涨2%触发（市价平）
+        try:
+            trader.set_stop_loss(symbol, 'BUY', qty_int, sl_trigger)
+            print(f"  ✅ 止损 @ ${sl_trigger} (涨1%触发，杠杆前1%止损")
+        except Exception as e:
+            print(f"  ⚠️ 止损设置失败: {e}")
+        print(f"  ℹ️ 止盈由LLM分析后设置")
     else:
         print(f"\n❌ 开空仓失败: {result}")
     return result
@@ -1979,14 +2067,13 @@ def do_close_short(symbol: str, percent: float = 100) -> Dict:
 
     # 支持部分平仓
     if percent < 100:
-        # 获取当前持仓量,计算要平的数量
         positions = trader.get_positions(symbol)
         for pos in positions:
             if pos.get('positionSide') == 'SHORT' or (pos['amount'] < 0):
                 total_qty = abs(pos['amount'])
                 close_qty = total_qty * (percent / 100)
                 print(f"部分平仓: {percent}% = {close_qty:.4f} / {total_qty:.4f} (全仓)")
-                result = trader.close_short(symbol, close_qty)
+                result = trader.close_position(symbol, close_qty)
                 print(f"订单结果: {json.dumps(result, indent=2)}")
                 if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
                     print(f"\n✅ 部分平空仓成功({percent}%)")
@@ -1995,8 +2082,7 @@ def do_close_short(symbol: str, percent: float = 100) -> Dict:
                 return result
         raise Exception(f"No short position found for {symbol}")
     else:
-        # 全平仓
-        result = trader.close_short(symbol)
+        result = trader.close_position(symbol)
         print(f"订单结果: {json.dumps(result, indent=2)}")
         if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
             print(f"\n✅ 平空仓成功")
@@ -2004,16 +2090,14 @@ def do_close_short(symbol: str, percent: float = 100) -> Dict:
             print(f"\n❌ 平仓失败: {result}")
         return result
 
-def do_open_long(symbol: str, margin: float, leverage: int, sl_pct: float = None, tp_pct: float = None) -> Dict:
+def do_open_long(symbol: str, margin: float, leverage: int) -> Dict:
     """开多仓"""
-    sl = (sl_pct / 100.0) if sl_pct is not None else SL_PCT
-    tp = (tp_pct / 100.0) if tp_pct is not None else TP_PCT
     trader = BinanceTrader()
     price = trader.get_price(symbol)
 
-    step_size = 1
+    step_size = None
     try:
-        r = requests.get(f"{FAPI_URL}/fapi/v1/exchangeInfo", timeout=10)
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo')
         for s in r.json().get('symbols', []):
             if s['symbol'] == symbol:
                 for f in s.get('filters', []):
@@ -2021,13 +2105,16 @@ def do_open_long(symbol: str, margin: float, leverage: int, sl_pct: float = None
                         step_size = float(f['stepSize'])
                         break
                 break
-    except:
+    except Exception:
         pass
 
     quantity = (margin * leverage) / price
-    quantity = round(round(quantity / step_size) * step_size, 8)
+    if step_size and step_size > 0:
+        quantity = round(round(quantity / step_size) * step_size, 8)
+    else:
+        quantity = round(quantity, 8)
     if quantity <= 0:
-        quantity = step_size
+        quantity = 0.00000001
 
     print(f"\n{'='*60}")
     print(f"🟢 开多仓: {symbol}")
@@ -2038,13 +2125,21 @@ def do_open_long(symbol: str, margin: float, leverage: int, sl_pct: float = None
     print(f"数量: {quantity}")
     print()
 
-    result = trader.open_long(symbol, quantity, leverage, sl, tp)
+    result = trader.open_long(symbol, quantity, leverage)
     print(f"订单结果: {json.dumps(result, indent=2)}")
     # 判断是否成功
     if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
         print(f"\n✅ 开多仓成功")
-        # 立即将持仓注册到监控状态（使用开仓时指定的sl/tp）
-        check_and_trigger_stops(sl_pct, tp_pct)
+        # ===== 自动设置止损（杠杆前1%，止盈由LLM设置）=====
+        import math
+        qty_int = max(1, math.ceil(quantity))
+        sl_trigger = round(price * 0.98, 6)   # 止损: 跌2%触发（市价平）
+        try:
+            trader.set_stop_loss(symbol, 'SELL', qty_int, sl_trigger)
+            print(f"  ✅ 止损 @ ${sl_trigger} (跌1%触发，杠杆前1%止损")
+        except Exception as e:
+            print(f"  ⚠️ 止损设置失败: {e}")
+        print(f"  ℹ️ 止盈由LLM分析后设置")
     else:
         print(f"\n❌ 开多仓失败: {result}")
     return result
@@ -2059,14 +2154,13 @@ def do_close_long(symbol: str, percent: float = 100) -> Dict:
 
     # 支持部分平仓
     if percent < 100:
-        # 获取当前持仓量,计算要平的数量
         positions = trader.get_positions(symbol)
         for pos in positions:
             if pos.get('positionSide') == 'LONG' or (pos['amount'] > 0):
                 total_qty = abs(pos['amount'])
                 close_qty = total_qty * (percent / 100)
                 print(f"部分平仓: {percent}% = {close_qty:.4f} / {total_qty:.4f} (全仓)")
-                result = trader.close_long(symbol, close_qty)
+                result = trader.close_position(symbol, close_qty)
                 print(f"订单结果: {json.dumps(result, indent=2)}")
                 if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
                     print(f"\n✅ 部分平多仓成功({percent}%)")
@@ -2075,8 +2169,7 @@ def do_close_long(symbol: str, percent: float = 100) -> Dict:
                 return result
         raise Exception(f"No long position found for {symbol}")
     else:
-        # 全平仓
-        result = trader.close_long(symbol)
+        result = trader.close_position(symbol)
         print(f"订单结果: {json.dumps(result, indent=2)}")
         if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
             print(f"\n✅ 平多仓成功")
@@ -2113,14 +2206,6 @@ def main():
     scan_all_parser.add_argument('--klines', type=int, default=30, help='给多少个候选拿K线')
     scan_all_parser.add_argument('--log', type=str, default=None, help='日志文件（覆盖模式，默认stdout）')
 
-    # monitor(止损止盈守护进程)
-    monitor_parser = subparsers.add_parser('monitor', help='止损止盈监控')
-    monitor_parser.add_argument('--interval', type=int, default=5, help='检查间隔（秒，默认5）')
-    monitor_parser.add_argument('--sl', type=float, default=None, help=f'止损百分比，如 1.5（默认{SL_PCT*100}%）')
-    monitor_parser.add_argument('--tp', type=float, default=None, help=f'移动止盈回调率，如 0.8（默认{TP_PCT*100}%）')
-    monitor_parser.add_argument('--once', action='store_true', help='只检查一次（用于cron）')
-    monitor_parser.add_argument('--reset', action='store_true', help='重置监控状态')
-
     # market
     market_parser = subparsers.add_parser('market', help='市场数据')
     market_parser.add_argument('--symbol', type=str, required=True, help='币种')
@@ -2131,8 +2216,6 @@ def main():
     open_parser.add_argument('margin', type=float, help='保证金')
     open_parser.add_argument('--symbol', type=str, required=True, help='币种')
     open_parser.add_argument('--leverage', type=int, default=10, help='杠杆')
-    open_parser.add_argument('--sl', type=float, default=None, help='止损百分比，如 1.5 表示 1.5%%')
-    open_parser.add_argument('--tp', type=float, default=None, help='移动止盈回调率，如 0.8 表示 0.8%%')
 
 
     # close-short
@@ -2145,8 +2228,6 @@ def main():
     open_long_parser.add_argument('margin', type=float, help='保证金')
     open_long_parser.add_argument('--symbol', type=str, required=True, help='币种')
     open_long_parser.add_argument('--leverage', type=int, default=10, help='杠杆')
-    open_long_parser.add_argument('--sl', type=float, default=None, help='止损百分比，如 1.5 表示 1.5%%')
-    open_long_parser.add_argument('--tp', type=float, default=None, help='移动止盈回调率，如 0.8 表示 0.8%%')
 
     # close-long
     close_long_parser = subparsers.add_parser('close-long', help='平多仓')
@@ -2161,31 +2242,41 @@ def main():
     llm_hold_parser = subparsers.add_parser('llm-hold', help='LLM分析持仓')
     llm_hold_parser.add_argument('--symbol', type=str, required=True, help='币种')
 
+    # replace-order: 替换条件单（自动取消旧单+下新单）
+    replace_parser = subparsers.add_parser('replace-order', help='替换条件单(自动取消旧单后下新单)')
+    replace_parser.add_argument('--symbol', type=str, required=True, help='币种')
+    replace_parser.add_argument('--side', type=str, required=True, help="SELL=平多/BUY=平空")
+    replace_parser.add_argument('--price', type=float, required=True, help='新触发价格')
+    replace_parser.add_argument('--type', type=str, default='STOP_MARKET',
+                                  help="STOP_MARKET/TAKE_PROFIT_MARKET/STOP/TAKE_PROFIT")
+    replace_parser.add_argument('--algo-id', type=int, default=None,
+                                  help='旧条件单ID（可选）')
+
+    # cancel-conditionals: 取消指定币种全部追踪的委托单
+    cancel_cond_parser = subparsers.add_parser('cancel-conditionals', help='取消指定币种全部追踪的委托单')
+    cancel_cond_parser.add_argument('--symbol', type=str, required=True, help='币种')
+    cancel_cond_parser.add_argument('--side', type=str, default=None,
+                                  help='SELL=平多/BUY=平空（可选，不填则取消该币种全部）')
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         return
 
-    trader = BinanceTrader()
-
     if args.command == 'status':
         get_status(args.symbol)
 
     elif args.command == 'scan':
-        check_and_trigger_stops()  # 先检查止损
         scan_candidates(args.min_change)
 
     elif args.command == 'scan-short':
-        check_and_trigger_stops()
         scan_short_candidates(args.min_change)
 
     elif args.command == 'scan-long':
-        check_and_trigger_stops()
         scan_long_candidates(args.min_change, args.max_change)
 
     elif args.command == 'scan-all':
-        check_and_trigger_stops()  # 先检查止损
         _orig_out = os.dup(sys.stdout.fileno())
         _orig_err = os.dup(sys.stderr.fileno())
         _log_fd = None
@@ -2216,7 +2307,7 @@ def main():
         if not args.symbol:
             print("Error: --symbol is required")
             return
-        do_open_short(args.symbol, args.margin, args.leverage, getattr(args, 'sl', None), getattr(args, 'tp', None))
+        do_open_short(args.symbol, args.margin, args.leverage)
 
     elif args.command == 'close-short':
         if not args.symbol:
@@ -2228,7 +2319,7 @@ def main():
         if not args.symbol:
             print("Error: --symbol is required")
             return
-        do_open_long(args.symbol, args.margin, args.leverage, getattr(args, 'sl', None), getattr(args, 'tp', None))
+        do_open_long(args.symbol, args.margin, args.leverage)
 
     elif args.command == 'close-long':
         if not args.symbol:
@@ -2248,8 +2339,37 @@ def main():
             return
         do_llm_analysis(args.symbol, "hold")
 
-    elif args.command == 'monitor':
-        do_monitor(args)
+    elif args.command == 'replace-order':
+        trader = BinanceTrader()
+        positions = trader.get_positions(args.symbol)
+        if not positions:
+            print(f"❌ 无持仓: {args.symbol}")
+            return
+        qty = int(max(1, abs(positions[0]['amount'])))
+        result = trader.replace_conditional_order(
+            args.symbol, args.side, qty, args.price, args.type, args.algo_id
+        )
+        print(f"✅ 条件单已替换: {result}")
+
+    elif args.command == 'cancel-conditionals':
+        trader = BinanceTrader()
+        orders = _load_conditional_orders()
+        sym = args.symbol
+        if sym not in orders or not orders[sym]:
+            print(f"❌ 无追踪记录: {sym}")
+        else:
+            cancelled = 0
+            for side, algo_id in list(orders[sym].items()):
+                if args.side and args.side != side:
+                    continue
+                try:
+                    trader.cancel_conditional_order(sym, algo_id)
+                    print(f"✅ 已取消 {sym} {side} algo_id={algo_id}")
+                    cancelled += 1
+                except Exception as e:
+                    print(f"⚠️ 取消失败 {sym} {side}: {e}")
+            if cancelled == 0:
+                print(f"❌ 未找到匹配的追踪记录")
 
 if __name__ == '__main__':
     main()
