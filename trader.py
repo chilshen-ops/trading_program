@@ -1941,7 +1941,7 @@ def print_market_data(data: Dict):
     print()
     print(f"【技术指标】")
     print(f"  RSI(14):     {data['rsi']:.2f}")
-    print(f"  MACD:        macd={data['macd']['macd']:.4f} signal={data['macd']['signal']:.4f} hist={data['macd']['histogram']:.4f}")
+    print(f"  MACD:        macd={data['macd']['macd']:.4f}")
     print(f"  布林带:      上 ${data['bollinger']['upper']:.2f} / 中 ${data['bollinger']['middle']:.2f} / 下 ${data['bollinger']['lower']:.2f}")
     print(f"  位置:        {data['bollinger']['position']:.1f}%")
     print(f"  ATR:         {data['atr']:.2f} ({data['atr_percent']}%)")
@@ -2341,13 +2341,20 @@ def main():
 
     elif args.command == 'replace-order':
         trader = BinanceTrader()
+        # 优先用命令行 --algo-id，其次从文件查找
+        algo_id = args.algo_id
+        if not algo_id:
+            orders = _load_conditional_orders()
+            algo_id = orders.get(args.symbol, {}).get(args.side)
+        # 获取数量（优先查持仓，其次从文件）
         positions = trader.get_positions(args.symbol)
-        if not positions:
-            print(f"❌ 无持仓: {args.symbol}")
-            return
-        qty = int(max(1, abs(positions[0]['amount'])))
+        if positions:
+            qty = int(max(1, abs(positions[0]['amount'])))
+        else:
+            # 无持仓时qty传1（条件单数量不影响实际平仓）
+            qty = 1
         result = trader.replace_conditional_order(
-            args.symbol, args.side, qty, args.price, args.type, args.algo_id
+            args.symbol, args.side, qty, args.price, args.type, algo_id
         )
         print(f"✅ 条件单已替换: {result}")
 
