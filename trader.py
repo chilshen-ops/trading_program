@@ -106,45 +106,50 @@ def _save_conditional_orders(orders: Dict):
         pass
 
 
-# ========== binance-connector 客户端(用于 PAPI 签名)==========
-sys.path.insert(0, '/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages')
-try:
-    from binance.client import Client as BinanceClient
-except ImportError:
-    BinanceClient = None
-
-# PM 账户检测
+# ========== PM 账户检测（纯 requests，无第三方客户端依赖）==========
 _is_pm_account = None
-_papi_client = None
+
+
+def _papi_get_account(retries: int = 3) -> Dict:
+    """直接用 requests 发 papi 签名请求获取账户信息（不依赖 BinanceClient），带重试"""
+    ts = str(int(time.time() * 1000))
+    query = f"timestamp={ts}"
+    signature = hmac.new(
+        API_SECRET.encode(), query.encode(), hashlib.sha256
+    ).hexdigest()
+    url = f"{PAPI_URL}/papi/v1/um/account?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": API_KEY}
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                raise Exception(f"papi account Error {r.status_code}: {r.text}")
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1 * (attempt + 1))  # 1s, 2s backoff
+    raise last_err
+
 
 def is_portfolio_margin() -> bool:
-    """检测是否为 Portfolio Margin 账户"""
+    """检测是否为 Portfolio Margin 账户（检查 tradeGroupId 字段）"""
     global _is_pm_account
     if _is_pm_account is not None:
         return _is_pm_account
-    # 直接尝试 PAPI(PM 账户可用,非 PM 账户会报错)
     try:
-        client = _get_papi_client()
-        if client:
-            acct = client.papi_get_account()
-            # PM 账户有 totalAvailableBalance 字段
-            if 'totalAvailableBalance' in acct or 'uniMMR' in acct:
-                _is_pm_account = True
-                print(f"[PM] 检测到 Portfolio Margin 账户 (PM_2)", file=sys.stderr)
-            else:
-                _is_pm_account = False
+        acct = _papi_get_account()
+        # PM 账户响应结构: {tradeGroupId, assets, positions}
+        # 非 PM 账户 papi 会报错（无权限）
+        if "tradeGroupId" in acct or "assets" in acct:
+            _is_pm_account = True
+            print(f"[PM] 检测到 Portfolio Margin 账户 (tradeGroupId={acct.get('tradeGroupId')})", file=sys.stderr)
         else:
             _is_pm_account = False
-    except Exception as e:
+    except Exception:
         _is_pm_account = False
     return _is_pm_account
-
-def _get_papi_client():
-    """获取 PAPI 客户端(延迟初始化)"""
-    global _papi_client
-    if _papi_client is None and BinanceClient is not None:
-        _papi_client = BinanceClient(API_KEY, API_SECRET)
-    return _papi_client
 
 # ========== Binance API 封装(PAPI 版)==========
 class BinanceTrader:
@@ -153,14 +158,7 @@ class BinanceTrader:
         self.api_secret = API_SECRET
         self.fapi_url = FAPI_URL
         self.papi_url = PAPI_URL
-        self._papi = None  # lazy load
-
-    @property
-    def papi(self):
-        """延迟加载 PAPI 客户端"""
-        if self._papi is None:
-            self._papi = _get_papi_client()
-        return self._papi
+        self._papi = None  # kept for compat, unused for signing
 
     def _sign(self, params: Dict) -> str:
         """fapi 签名"""
@@ -192,36 +190,59 @@ class BinanceTrader:
             self.api_secret.encode(), query.encode(), hashlib.sha256
         ).hexdigest()
 
-    def _papi_request(self, method: str, endpoint: str, params: Dict = None) -> Dict:
-        """PAPI 签名请求 (PM 统一账户)"""
+    def _papi_request(self, method: str, endpoint: str, params: Dict = None, retries: int = 3) -> Dict:
+        """PAPI 签名请求 (PM 统一账户)，带重试"""
         headers = {'X-MBX-APIKEY': self.api_key}
         if params is None:
             params = {}
         signed_params = self._papi_sign(params)
         url = f"{self.papi_url}{endpoint}?{signed_params}"
-        if method == 'GET':
-            r = requests.get(url, headers=headers, timeout=10)
-        elif method == 'POST':
-            r = requests.post(url, headers=headers, timeout=10)
-        elif method == 'DELETE':
-            r = requests.delete(url, headers=headers, timeout=10)
-        if r.status_code != 200:
-            raise Exception(f"papi Error {r.status_code}: {r.text}")
-        return r.json()
+        last_err = None
+        for attempt in range(retries):
+            try:
+                if method == 'GET':
+                    r = requests.get(url, headers=headers, timeout=15)
+                elif method == 'POST':
+                    r = requests.post(url, headers=headers, timeout=15)
+                elif method == 'DELETE':
+                    r = requests.delete(url, headers=headers, timeout=15)
+                if r.status_code != 200:
+                    raise Exception(f"papi Error {r.status_code}: {r.text}")
+                return r.json()
+            except Exception as e:
+                last_err = e
+                if attempt < retries - 1:
+                    time.sleep(1 * (attempt + 1))
+        raise last_err
 
     # ---- 市场数据(fapi 公开端点)----
     def get_price(self, symbol: str) -> float:
+        """获取当前价格（优先 papi，降级 fapi，再降级 klines）"""
+        # 1. 优先 papi (PM账户可用)
         try:
-            # 优先用 papi (PM账户可用)，降级用 fapi
             r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/ticker/price", endpoint='um/ticker/price', params={'symbol': symbol})
             data = r.json()
-            if 'price' in data:
+            if isinstance(data, dict) and 'price' in data:
                 return float(data['price'])
         except Exception:
             pass
-        # fapi 降级
-        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/price", endpoint='ticker/price', params={'symbol': symbol})
-        return float(r.json()['price'])
+        # 2. fapi 降级
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/price", endpoint='ticker/price', params={'symbol': symbol})
+            data = r.json()
+            if isinstance(data, dict) and 'price' in data:
+                return float(data['price'])
+        except Exception:
+            pass
+        # 3. 最终降级：从 klines 取最新收盘价
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/klines", endpoint='klines', params={'symbol': symbol, 'interval': '1m', 'limit': 1})
+            klines = r.json()
+            if klines:
+                return float(klines[-1][4])  # 收盘价
+        except Exception:
+            pass
+        raise Exception(f"无法获取 {symbol} 价格（所有端点均失败）")
 
     def get_ticker(self, symbol: str) -> Dict:
         r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={'symbol': symbol})
@@ -451,7 +472,7 @@ class BinanceTrader:
                               for s, v in _sim_positions.items()]
             }
         if is_portfolio_margin():
-            return self.papi.papi_get_account()
+            return _papi_get_account()
         params = {'timestamp': int(time.time()*1000)}
         params['signature'] = self._sign(params)
         r = _rl_request('GET', f"{self.fapi_url}/fapi/v2/account", endpoint='account', headers={'X-MBX-APIKEY': self.api_key}, params=params)
@@ -481,7 +502,9 @@ class BinanceTrader:
             return result
         if is_portfolio_margin():
             try:
-                positions = self.papi.papi_get_um_position_risk()
+                # 直接复用 account 数据中的 positions（避免多一次 HTTP 请求）
+                acct = _papi_get_account()
+                positions = acct.get('positions', []) if not symbol else [p for p in acct.get('positions', []) if p.get('symbol') == symbol]
                 result = []
                 for pos in positions:
                     amt = float(pos.get('positionAmt', 0))
@@ -493,7 +516,7 @@ class BinanceTrader:
                         'symbol': pos['symbol'],
                         'amount': abs(amt),  # 保留小数精度,平仓时再取整
                         'entryPrice': float(pos.get('entryPrice', 0)),
-                        'unrealizedProfit': float(pos.get('unRealizedProfit', 0)),
+                        'unrealizedProfit': float(pos.get('unrealizedProfit', 0)),
                         'leverage': int(pos.get('leverage', 1)),
                         'positionSide': 'SHORT' if amt < 0 else 'LONG'
                     })
@@ -518,13 +541,33 @@ class BinanceTrader:
         return positions
 
     def get_usdt_balance(self) -> float:
-        """获取USDT余额"""
+        """获取USDT余额（PM 统一账户）
+
+        PM 账户：使用 /papi/v1/balance → totalWalletBalance（统一账户总余额）
+        非 PM 账户：使用标准现货 account → free balance
+        """
         if SIMULATE:
             _load_sim_state()
             return _sim_balance
         if is_portfolio_margin():
-            account = self.papi.papi_get_account()
-            return float(account.get('totalAvailableBalance', 0))
+            try:
+                import urllib3
+                import json as _json
+                ts = str(int(time.time() * 1000))
+                q = f"timestamp={ts}"
+                sig = hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+                url = f"https://papi.binance.com/papi/v1/balance?{q}&signature={sig}"
+                pool = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
+                headers = {"X-MBX-APIKEY": API_KEY}
+                r = pool.urlopen('GET', url, headers=headers, timeout=10.0)
+                data = _json.loads(r.data)
+                for item in data:
+                    if item.get('asset') == 'USDT':
+                        return float(item.get('totalWalletBalance', 0))
+                return 0.0
+            except Exception:
+                return 0.0
+        # 非 PM 账户
         account = self.get_account()
         if 'balances' in account:
             for bal in account.get('balances', []):
@@ -572,12 +615,12 @@ class BinanceTrader:
             if quantity is None:
                 quantity = abs(pos['amount'])
             qty_int = max(1, math.ceil(quantity))
-            return self.papi.papi_create_um_order(
-                symbol=symbol,
-                side='SELL' if pos['positionSide'] == 'LONG' else 'BUY',
-                type='MARKET',
-                quantity=qty_int
-            )
+            return self._papi_request('POST', '/papi/v1/um/order', {
+                'symbol': symbol,
+                'side': 'SELL' if pos['positionSide'] == 'LONG' else 'BUY',
+                'type': 'MARKET',
+                'quantity': qty_int
+            })
         import math
         positions = self.get_positions(symbol)
         if not positions:
@@ -607,7 +650,7 @@ class BinanceTrader:
         if SIMULATE:
             return {'leverage': leverage, 'symbol': symbol}
         if is_portfolio_margin():
-            return self.papi.papi_set_um_leverage(symbol=symbol, leverage=leverage)
+            return self._papi_request('POST', '/papi/v1/um/leverage', {'symbol': symbol, 'leverage': leverage})
         params = {'symbol': symbol, 'leverage': leverage, 'timestamp': int(time.time()*1000)}
         params['signature'] = self._sign(params)
         r = requests.post(f"{self.fapi_url}/fapi/v1/leverage",
@@ -661,12 +704,12 @@ class BinanceTrader:
             qty_int = math.floor(quantity)
             if qty_int == 0:
                 qty_int = 1
-            result = self.papi.papi_create_um_order(
-                symbol=symbol,
-                side='SELL',
-                type='MARKET',
-                quantity=qty_int
-            )
+            result = self._papi_request('POST', '/papi/v1/um/order', {
+                'symbol': symbol,
+                'side': 'SELL',
+                'type': 'MARKET',
+                'quantity': qty_int
+            })
             return result
         # fapi
         params = {
@@ -725,12 +768,12 @@ class BinanceTrader:
             qty_int = math.floor(quantity)
             if qty_int == 0:
                 qty_int = 1
-            result = self.papi.papi_create_um_order(
-                symbol=symbol,
-                side='BUY',
-                type='MARKET',
-                quantity=qty_int
-            )
+            result = self._papi_request('POST', '/papi/v1/um/order', {
+                'symbol': symbol,
+                'side': 'BUY',
+                'type': 'MARKET',
+                'quantity': qty_int
+            })
             return result
         params = {
             'symbol': symbol,
@@ -798,12 +841,12 @@ class BinanceTrader:
             qty_int = 1
 
         if is_portfolio_margin():
-            result = self.papi.papi_create_um_order(
-                symbol=symbol,
-                side='SELL',
-                type='MARKET',
-                quantity=qty_int
-            )
+            result = self._papi_request('POST', '/papi/v1/um/order', {
+                'symbol': symbol,
+                'side': 'SELL',
+                'type': 'MARKET',
+                'quantity': qty_int
+            })
             self._clear_conditional_orders(symbol)
             return result
         params = {
@@ -969,29 +1012,41 @@ def get_recent_highs(symbol: str, periods: List[int] = [7, 30]) -> Dict:
     return result
 
 def detect_reversal_signals(symbol: str) -> Dict:
-    """检测见顶回落信号(只用5m+30m,不足时fallback到1h)"""
+    """检测见顶回落信号(5m+30m+1h+4h)"""
     _empty = {'score': 0, 'reasons': [], 'rsi_14': 50, 'rsi_7': 50, 'rsi_5m': 50,
+              'rsi_1h': 50, 'rsi_4h': 50,
               'ma5_dev': 0, 'ma20_dev': 0, 'vol_ratio': 1, 'waterfall': False,
-              'macd_dead_cross': False, 'multi_rsi_overbought': 0}
+              'macd_dead_cross_30m': False, 'macd_dead_cross_1h': False, 'macd_dead_cross_4h': False,
+              'multi_rsi_overbought': 0}
     try:
         klines_5m = requests.get(f"{FAPI_URL}/fapi/v1/klines",
                                   params={'symbol': symbol, 'interval': '5m', 'limit': 20}, timeout=10).json()
         klines_30m = requests.get(f"{FAPI_URL}/fapi/v1/klines",
                                   params={'symbol': symbol, 'interval': '30m', 'limit': 10}, timeout=10).json()
+        klines_1h = requests.get(f"{FAPI_URL}/fapi/v1/klines",
+                                 params={'symbol': symbol, 'interval': '1h', 'limit': 10}, timeout=10).json()
+        klines_4h = requests.get(f"{FAPI_URL}/fapi/v1/klines",
+                                 params={'symbol': symbol, 'interval': '4h', 'limit': 6}, timeout=10).json()
 
-        if len(klines_5m) < 10 or len(klines_30m) < 5:
+        if len(klines_5m) < 10 or len(klines_30m) < 5 or len(klines_1h) < 5 or len(klines_4h) < 3:
             return _empty
 
         closes_5m = [float(k[4]) for k in klines_5m]
         closes_30m = [float(k[4]) for k in klines_30m]
+        closes_1h = [float(k[4]) for k in klines_1h]
+        closes_4h = [float(k[4]) for k in klines_4h]
         volumes_5m = [float(k[5]) for k in klines_5m]
 
         rsi_14 = TechnicalIndicators.calculate_rsi(closes_30m, 14)
         rsi_7 = TechnicalIndicators.calculate_rsi(closes_30m, 7)
         rsi_5m = TechnicalIndicators.calculate_rsi(closes_5m, 14)
+        rsi_1h = TechnicalIndicators.calculate_rsi(closes_1h, 14)
+        rsi_4h = TechnicalIndicators.calculate_rsi(closes_4h, 14)
 
-        # MACD 30M
+        # MACD 多周期
         macd_30m = TechnicalIndicators.calculate_macd(closes_30m)
+        macd_1h = TechnicalIndicators.calculate_macd(closes_1h)
+        macd_4h = TechnicalIndicators.calculate_macd(closes_4h)
 
         # 短期均线偏离
         ma5 = TechnicalIndicators.calculate_ma(closes_30m, 5)
@@ -1006,19 +1061,17 @@ def detect_reversal_signals(symbol: str) -> Dict:
         prev_vol = sum(volumes_5m[-10:-5]) / 5
         vol_ratio = recent_vol / prev_vol if prev_vol > 0 else 1
 
-        # 价格创新高但RSI背离(价格新高但RSI低于前期高点)
-        rsi_swing_high = max([TechnicalIndicators.calculate_rsi(closes_30m[:i+14], 14)
-                             for i in range(50, len(closes_30m)-14)])
-
         # 多周期RSI共振超买
-        multi_rsi_overbought = (rsi_14 > 70) + (rsi_7 > 75) + (rsi_5m > 70)
+        multi_rsi_overbought = (rsi_14 > 70) + (rsi_7 > 75) + (rsi_5m > 70) + (rsi_1h > 70) + (rsi_4h > 70)
 
         # 瀑布信号:最近3根K线收盘价连续下降
         last_3 = closes_30m[-3:]
         waterfall = all(last_3[i] > last_3[i+1] for i in range(2))
 
-        # MACD死叉信号
-        macd_dead_cross = macd_30m['macd'] < macd_30m['signal'] and macd_30m['histogram'] < 0
+        # MACD死叉信号(多周期确认)
+        macd_dead_cross_30m = macd_30m['macd'] < macd_30m['signal'] and macd_30m['histogram'] < 0
+        macd_dead_cross_1h = macd_1h['macd'] < macd_1h['signal'] and macd_1h['histogram'] < 0
+        macd_dead_cross_4h = macd_4h['macd'] < macd_4h['signal'] and macd_4h['histogram'] < 0
 
         # 综合做空评分
         score = 0
@@ -1042,12 +1095,18 @@ def detect_reversal_signals(symbol: str) -> Dict:
         if waterfall:
             score += 15
             reasons.append('K线瀑布')
-        if macd_dead_cross:
+        if macd_dead_cross_30m or macd_dead_cross_1h or macd_dead_cross_4h:
             score += 10
             reasons.append('MACD死叉')
         if rsi_5m > 70:
             score += 10
             reasons.append(f'5m_RSI超买')
+        if rsi_1h > 70:
+            score += 10
+            reasons.append(f'1h_RSI超买')
+        if rsi_4h > 70:
+            score += 10
+            reasons.append(f'4h_RSI超买')
 
         return {
             'score': score,
@@ -1055,26 +1114,30 @@ def detect_reversal_signals(symbol: str) -> Dict:
             'rsi_14': rsi_14,
             'rsi_7': rsi_7,
             'rsi_5m': rsi_5m,
+            'rsi_1h': rsi_1h,
+            'rsi_4h': rsi_4h,
             'ma5_dev': round(ma5_dev, 2),
             'ma20_dev': round(ma20_dev, 2),
             'vol_ratio': round(vol_ratio, 2),
             'waterfall': waterfall,
-            'macd_dead_cross': macd_dead_cross,
+            'macd_dead_cross_30m': macd_dead_cross_30m,
+            'macd_dead_cross_1h': macd_dead_cross_1h,
+            'macd_dead_cross_4h': macd_dead_cross_4h,
             'multi_rsi_overbought': multi_rsi_overbought
         }
     except Exception as e:
         return {'score': 0, 'reasons': [], 'rsi_14': 50, 'rsi_7': 50, 'rsi_5m': 50,
+                'rsi_1h': 50, 'rsi_4h': 50,
                 'ma5_dev': 0, 'ma20_dev': 0, 'vol_ratio': 1, 'waterfall': False,
-                'macd_dead_cross': False, 'multi_rsi_overbought': 0}
+                'macd_dead_cross_30m': False, 'macd_dead_cross_1h': False, 'macd_dead_cross_4h': False,
+                'multi_rsi_overbought': 0}
 
 # ========== LLM 分析模块 ==========
 def format_for_llm(symbol: str, action: str = "open") -> str:
-    """格式化 K 线数据供 LLM 分析(只用5m+30m+1h)"""
+    """格式化 K 线原始数据供 LLM 分析（无指标、无方向提示）"""
 
-    # 只用5m+30m+1h
-    # 5m:10根, 30m:40根, 1h:80根
-    intervals = ["5m", "30m", "1h"]
-    limits = {"5m": 10, "30m": 40, "1h": 80}
+    intervals = ["5m", "30m", "1h", "4h"]
+    limits = {"5m": 10, "30m": 40, "1h": 80, "4h": 6}
     result = {}
 
     for interval in intervals:
@@ -1088,67 +1151,25 @@ def format_for_llm(symbol: str, action: str = "open") -> str:
         except Exception:
             result[interval] = []
 
-    lines = [f"# {symbol} {'开仓' if action == 'open' else '持仓'}分析", ""]
-    lines.append(f"现在需要你判断:{'是否应该做空' if action == 'open' else '是否应该平仓'}")
-    lines.append("")
+    lines = [f"# {symbol} K线原始数据 ({action})", ""]
 
     for interval, klines in result.items():
-        if not klines:
+        # 检查是否为空或非列表（可能是rate limit错误响应）
+        if not isinstance(klines, list) or not klines:
+            lines.append(f"## {interval}: 无数据\n")
             continue
 
-        closes = [float(k[4]) for k in klines]
-        opens = [float(k[1]) for k in klines]
-        highs = [float(k[2]) for k in klines]
+        lines.append(f"## {interval} ({len(klines)} 根)")
+        lines.append(f"{'时间':<20} {'开':>12} {'高':>12} {'低':>12} {'收':>12} {'成交量':>14}")
+        lines.append("-" * 82)
 
-        total_change = ((closes[-1] - opens[0]) / opens[0] * 100) if opens[0] > 0 else 0
-
-        consecutive = 0
-        trend_desc = ""
-        for i in range(len(closes)-1, 0, -1):
-            if closes[i] > closes[i-1]:
-                consecutive += 1
-                trend_desc = "连涨"
-            elif closes[i] < closes[i-1]:
-                consecutive -= 1
-                trend_desc = "连跌"
-            else:
-                break
-
-        recent5 = closes[-5:]
-        recent_trend = "震荡"
-        if len(recent5) >= 3:
-            if recent5[-1] > recent5[-2] > recent5[-3]:
-                recent_trend = "上涨中"
-            elif recent5[-1] < recent5[-2] < recent5[-3]:
-                recent_trend = "下跌中"
-
-        current = closes[-1]
-        period_high = max(highs)
-        dist_from_high = ((current - period_high) / period_high * 100) if period_high > 0 else 0
-
-        lines.append(f"## {interval} K线 ({len(klines)}根)")
-        lines.append(f"总变化: {total_change:+.2f}% | 距周期最高: {dist_from_high:+.2f}%")
-        lines.append(f"近期趋势: {recent_trend} | 连续: {consecutive}根 {trend_desc}")
-        lines.append("")
-
-        recent = klines[-20:] if len(klines) >= 20 else klines
-        lines.append(f"{'时间':<12} {'开盘':>10} {'收盘':>10} {'涨跌':>6} {'成交量':>12}")
-        lines.append("-" * 55)
-
-        for k in recent:
+        for k in klines:
             ts = k[0] / 1000
-            dt = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
-            o = float(k[1]); c = float(k[4]); v = float(k[5])
-            change = c - o
-            change_pct = (change / o * 100) if o > 0 else 0
-            emoji = "📈" if change >= 0 else "📉"
-            lines.append(f"{dt:<12} {o:>10.4f} {c:>10.4f} {emoji}{change_pct:+5.1f}% {v:>12.0f}")
+            dt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+            o = float(k[1]); h = float(k[2]); l = float(k[3])
+            c = float(k[4]); v = float(k[5])
+            lines.append(f"{dt:<20} {o:>12.6f} {h:>12.6f} {l:>12.6f} {c:>12.6f} {v:>14.2f}")
         lines.append("")
-
-    if action == "open":
-        lines.append("请分析以上数据,判断是否应该做空:1. 是否在高位刚开始下跌?2. 形态是否出现顶部信号?3. 预期跌幅多大?决策格式:{'decision': 'YES/NO', 'reason': '...', 'confidence': 60-100, 'expected_drop': '5-20%或不确定'}")
-    else:
-        lines.append("请分析空仓是否应该平仓:1. 下跌是否已经完成?2. 是否出现止跌信号?决策格式:{'decision': 'YES/NO', 'reason': '...', 'confidence': 60-100}")
 
     return "\n".join(lines)
 
@@ -1287,28 +1308,40 @@ def get_all_perpetual_symbols() -> List[str]:
     return symbols
 
 def detect_bottom_signals(symbol: str) -> Dict:
-    """检测见底反弹信号(只用5m+30m,不足时fallback到1h)"""
+    """检测见底反弹信号(5m+30m+1h+4h)"""
     _empty = {'score': 0, 'reasons': [], 'rsi_14': 50, 'rsi_7': 50, 'rsi_5m': 50,
+              'rsi_1h': 50, 'rsi_4h': 50,
               'ma5_dev': 0, 'ma20_dev': 0, 'vol_ratio': 1, 'rebound': False,
-              'macd_golden_cross': False, 'multi_rsi_oversold': 0}
+              'macd_golden_cross_30m': False, 'macd_golden_cross_1h': False, 'macd_golden_cross_4h': False,
+              'multi_rsi_oversold': 0}
     try:
         klines_5m = requests.get(f"{FAPI_URL}/fapi/v1/klines",
                                   params={'symbol': symbol, 'interval': '5m', 'limit': 20}, timeout=10).json()
         klines_30m = requests.get(f"{FAPI_URL}/fapi/v1/klines",
                                    params={'symbol': symbol, 'interval': '30m', 'limit': 10}, timeout=10).json()
+        klines_1h = requests.get(f"{FAPI_URL}/fapi/v1/klines",
+                                  params={'symbol': symbol, 'interval': '1h', 'limit': 10}, timeout=10).json()
+        klines_4h = requests.get(f"{FAPI_URL}/fapi/v1/klines",
+                                  params={'symbol': symbol, 'interval': '4h', 'limit': 6}, timeout=10).json()
 
-        if len(klines_5m) < 10 or len(klines_30m) < 5:
+        if len(klines_5m) < 10 or len(klines_30m) < 5 or len(klines_1h) < 5 or len(klines_4h) < 3:
             return _empty
 
         closes_5m = [float(k[4]) for k in klines_5m]
         closes_30m = [float(k[4]) for k in klines_30m]
+        closes_1h = [float(k[4]) for k in klines_1h]
+        closes_4h = [float(k[4]) for k in klines_4h]
         volumes_5m = [float(k[5]) for k in klines_5m]
 
         rsi_14 = TechnicalIndicators.calculate_rsi(closes_30m, 14)
         rsi_7 = TechnicalIndicators.calculate_rsi(closes_30m, 7)
         rsi_5m = TechnicalIndicators.calculate_rsi(closes_5m, 14)
+        rsi_1h = TechnicalIndicators.calculate_rsi(closes_1h, 14)
+        rsi_4h = TechnicalIndicators.calculate_rsi(closes_4h, 14)
 
         macd_30m = TechnicalIndicators.calculate_macd(closes_30m)
+        macd_1h = TechnicalIndicators.calculate_macd(closes_1h)
+        macd_4h = TechnicalIndicators.calculate_macd(closes_4h)
         ma5 = TechnicalIndicators.calculate_ma(closes_30m, 5)
         ma20 = TechnicalIndicators.calculate_ma(closes_30m, 20)
         current = closes_30m[-1]
@@ -1324,11 +1357,13 @@ def detect_bottom_signals(symbol: str) -> Dict:
         last_3 = closes_30m[-3:]
         rebound = all(last_3[i] < last_3[i+1] for i in range(2))
 
-        # MACD金叉信号
-        macd_golden_cross = macd_30m['macd'] > macd_30m['signal'] and macd_30m['histogram'] > 0
+        # MACD金叉信号(多周期确认)
+        macd_golden_cross_30m = macd_30m['macd'] > macd_30m['signal'] and macd_30m['histogram'] > 0
+        macd_golden_cross_1h = macd_1h['macd'] > macd_1h['signal'] and macd_1h['histogram'] > 0
+        macd_golden_cross_4h = macd_4h['macd'] > macd_4h['signal'] and macd_4h['histogram'] > 0
 
         # 多周期RSI共振超卖
-        multi_rsi_oversold = (rsi_14 < 30) + (rsi_7 < 25) + (rsi_5m < 30)
+        multi_rsi_oversold = (rsi_14 < 30) + (rsi_7 < 25) + (rsi_5m < 30) + (rsi_1h < 30) + (rsi_4h < 30)
 
         score = 0
         reasons = []
@@ -1351,12 +1386,18 @@ def detect_bottom_signals(symbol: str) -> Dict:
         if rebound:
             score += 15
             reasons.append('K线反弹')
-        if macd_golden_cross:
+        if macd_golden_cross_30m or macd_golden_cross_1h or macd_golden_cross_4h:
             score += 10
             reasons.append('MACD金叉')
         if rsi_5m < 30:
             score += 10
             reasons.append(f'5m_RSI超卖')
+        if rsi_1h < 30:
+            score += 10
+            reasons.append(f'1h_RSI超卖')
+        if rsi_4h < 30:
+            score += 10
+            reasons.append(f'4h_RSI超卖')
 
         return {
             'score': score,
@@ -1364,17 +1405,23 @@ def detect_bottom_signals(symbol: str) -> Dict:
             'rsi_14': rsi_14,
             'rsi_7': rsi_7,
             'rsi_5m': rsi_5m,
+            'rsi_1h': rsi_1h,
+            'rsi_4h': rsi_4h,
             'ma5_dev': round(ma5_dev, 2),
             'ma20_dev': round(ma20_dev, 2),
             'vol_ratio': round(vol_ratio, 2),
             'rebound': rebound,
-            'macd_golden_cross': macd_golden_cross,
+            'macd_golden_cross_30m': macd_golden_cross_30m,
+            'macd_golden_cross_1h': macd_golden_cross_1h,
+            'macd_golden_cross_4h': macd_golden_cross_4h,
             'multi_rsi_oversold': multi_rsi_oversold
         }
     except Exception as e:
         return {'score': 0, 'reasons': [], 'rsi_14': 50, 'rsi_7': 50, 'rsi_5m': 50,
+                'rsi_1h': 50, 'rsi_4h': 50,
                 'ma5_dev': 0, 'ma20_dev': 0, 'vol_ratio': 1, 'rebound': False,
-                'macd_golden_cross': False, 'multi_rsi_oversold': 0}
+                'macd_golden_cross_30m': False, 'macd_golden_cross_1h': False, 'macd_golden_cross_4h': False,
+                'multi_rsi_oversold': 0}
 
 def scan_long_candidates(min_change: float = -10, max_change: float = -3) -> List[Dict]:
     """
@@ -1863,6 +1910,7 @@ def get_market_data(symbol: str, kline_count: int = 15) -> Dict:
 
     # 最新价格
     current_price = closes[-1]
+    current_price_raw = None
     atr_percent = (atr / current_price * 100) if current_price > 0 else 0
 
     # 成交量变化
@@ -1935,7 +1983,14 @@ def print_market_data(data: Dict):
     print(f"\n{'='*60}")
     print(f"📊 {data['symbol']} 市场数据")
     print(f"{'='*60}")
-    print(f"当前价格: ${data['current_price']:.4f}")
+    # 直接从API获取原始价格（保持精度）
+    import requests
+    try:
+        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={data['symbol']}")
+        raw_price = r.json()['price']
+    except:
+        raw_price = str(data['current_price'])
+    print(raw_price)
     sign = '+' if data['change_24h'] >= 0 else ''
     print(f"24h涨幅: {sign}{data['change_24h']:.2f}%")
     print()
@@ -2246,7 +2301,7 @@ def main():
     replace_parser = subparsers.add_parser('replace-order', help='替换条件单(自动取消旧单后下新单)')
     replace_parser.add_argument('--symbol', type=str, required=True, help='币种')
     replace_parser.add_argument('--side', type=str, required=True, help="SELL=平多/BUY=平空")
-    replace_parser.add_argument('--price', type=float, required=True, help='新触发价格')
+    replace_parser.add_argument('--price', type=str, required=True, help='新触发价格或百分比，如 50000 或 1.01%（相对于当前价，自动确定方向）')
     replace_parser.add_argument('--type', type=str, default='STOP_MARKET',
                                   help="STOP_MARKET/TAKE_PROFIT_MARKET/STOP/TAKE_PROFIT")
     replace_parser.add_argument('--algo-id', type=int, default=None,
@@ -2353,8 +2408,29 @@ def main():
         else:
             # 无持仓时qty传1（条件单数量不影响实际平仓）
             qty = 1
+        # 解析 --price：支持绝对价格或百分比
+        # 百分比基于：不含杠杆的浮盈%（相对于入场价）
+        # SELL（平多）: --price=2% → 触发价 = 入场价 × (1 - 2/100)，即 -2% 浮亏止损
+        # BUY  （平空）: --price=2% → 触发价 = 入场价 × (1 + 2/100)，即 +2% 浮亏止损
+        price_arg = args.price
+        if isinstance(price_arg, str) and price_arg.endswith('%'):
+            pct = float(price_arg[:-1])
+            if not positions:
+                print(f"❌ 无持仓，无法用百分比设置止损（需要入场价）")
+                return
+            entry_price = float(positions[0].get('entryPrice', 0))
+            if entry_price <= 0:
+                print(f"❌ 入场价无效: {entry_price}")
+                return
+            if args.side.upper() == 'SELL':
+                trigger_price = entry_price * (1 - pct / 100)
+            else:  # BUY
+                trigger_price = entry_price * (1 + pct / 100)
+            print(f"[replace-order] 入场价={entry_price} → 触发价={trigger_price:.6f} ({pct}%{'亏损' if args.side.upper()=='SELL' else '亏损'}) [基于入场价]")
+        else:
+            trigger_price = float(price_arg)
         result = trader.replace_conditional_order(
-            args.symbol, args.side, qty, args.price, args.type, algo_id
+            args.symbol, args.side, qty, trigger_price, args.type, algo_id
         )
         print(f"✅ 条件单已替换: {result}")
 
