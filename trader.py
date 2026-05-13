@@ -59,9 +59,9 @@ _sim_positions = {}
 
 def _load_sim_state():
     """从文件加载模拟状态
-    
+
     Returns:
-        tuple: (balance, positions) — 总是返回 tuple，加载失败时返回默认值
+        tuple: (balance, positions) - 总是返回 tuple,加载失败时返回默认值
     """
     if os.path.exists(SIM_STATE_FILE):
         try:
@@ -72,7 +72,7 @@ def _load_sim_state():
             _sim_positions = state.get('positions', {})
             return (_sim_balance, _sim_positions)
         except Exception:
-            pass  # 文件损坏时仍返回默认值，保持一致性
+            pass  # 文件损坏时仍返回默认值,保持一致性
     return (1000.0, {})
 
 def _save_sim_state(balance, positions):
@@ -106,12 +106,12 @@ def _save_conditional_orders(orders: Dict):
         pass
 
 
-# ========== PM 账户检测（纯 requests，无第三方客户端依赖）==========
+# ========== PM 账户检测(纯 requests,无第三方客户端依赖)==========
 _is_pm_account = None
 
 
 def _papi_get_account(retries: int = 3) -> Dict:
-    """直接用 requests 发 papi 签名请求获取账户信息（不依赖 BinanceClient），带重试"""
+    """直接用 requests 发 papi 签名请求获取账户信息(不依赖 BinanceClient),带重试"""
     last_err = None
     for attempt in range(retries):
         try:
@@ -137,8 +137,8 @@ def _papi_get_account(retries: int = 3) -> Dict:
 _pm_check_retries = 0
 
 def is_portfolio_margin() -> bool:
-    """检测是否为 Portfolio Margin 账户（检查 tradeGroupId 字段）
-    遇到异常时不缓存结果，持续重试（避免网络抖动导致永久误判）"""
+    """检测是否为 Portfolio Margin 账户(检查 tradeGroupId 字段)
+    遇到异常时不缓存结果,持续重试(避免网络抖动导致永久误判)"""
     global _is_pm_account, _pm_check_retries
     if _is_pm_account is True:
         return True
@@ -199,14 +199,15 @@ class BinanceTrader:
         ).hexdigest()
 
     def _papi_request(self, method: str, endpoint: str, params: Dict = None, retries: int = 3) -> Dict:
-        """PAPI 签名请求 (PM 统一账户)，带重试"""
+        """PAPI 签名请求 (PM 统一账户),带重试 - 每次重试都重新签名"""
         headers = {'X-MBX-APIKEY': self.api_key}
         if params is None:
             params = {}
-        signed_params = self._papi_sign(params)
-        url = f"{self.papi_url}{endpoint}?{signed_params}"
         last_err = None
         for attempt in range(retries):
+            # ⭐ 每次重试都重新签名(时间戳必须最新)
+            signed_params = self._papi_sign(params.copy())
+            url = f"{self.papi_url}{endpoint}?{signed_params}"
             try:
                 if method == 'GET':
                     r = requests.get(url, headers=headers, timeout=15)
@@ -225,7 +226,7 @@ class BinanceTrader:
 
     # ---- 市场数据(fapi 公开端点)----
     def get_price(self, symbol: str) -> float:
-        """获取当前价格（优先 papi，降级 fapi，再降级 klines）"""
+        """获取当前价格(优先 papi,降级 fapi,再降级 klines)"""
         # 1. 优先 papi (PM账户可用)
         try:
             r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/ticker/price", endpoint='um/ticker/price', params={'symbol': symbol})
@@ -242,7 +243,7 @@ class BinanceTrader:
                 return float(data['price'])
         except Exception:
             pass
-        # 3. 最终降级：从 klines 取最新收盘价
+        # 3. 最终降级:从 klines 取最新收盘价
         try:
             r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/klines", endpoint='klines', params={'symbol': symbol, 'interval': '1m', 'limit': 1})
             klines = r.json()
@@ -250,7 +251,7 @@ class BinanceTrader:
                 return float(klines[-1][4])  # 收盘价
         except Exception:
             pass
-        raise Exception(f"无法获取 {symbol} 价格（所有端点均失败）")
+        raise Exception(f"无法获取 {symbol} 价格(所有端点均失败)")
 
     def get_ticker(self, symbol: str) -> Dict:
         r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={'symbol': symbol})
@@ -258,9 +259,9 @@ class BinanceTrader:
 
     def set_stop_loss(self, symbol: str, side: str, quantity: float, trigger_price: float) -> Dict:
         """PM账户设置止损条件单 (STOP_MARKET - 触发后市价平仓)
-        
+
         side: 'SELL'=平多, 'BUY'=平空
-        trigger_price: 触发价格（跌破此价触发）
+        trigger_price: 触发价格(跌破此价触发)
         """
         result = self._papi_request('POST', '/papi/v1/um/algo/order', {
             'symbol': symbol,
@@ -284,10 +285,10 @@ class BinanceTrader:
     def set_stop_loss_limit(self, symbol: str, side: str, quantity: float,
                             trigger_price: float, order_price: float) -> Dict:
         """PM账户设置止损条件单 (STOP - 触发后下限价单平仓)
-        
+
         side: 'SELL'=平多, 'BUY'=平空
-        trigger_price: 触发价格（跌破此价触发）
-        order_price: 下单价格（通常低于触发价）
+        trigger_price: 触发价格(跌破此价触发)
+        order_price: 下单价格(通常低于触发价)
         """
         return self._papi_request('POST', '/papi/v1/um/algo/order', {
             'symbol': symbol,
@@ -302,9 +303,9 @@ class BinanceTrader:
 
     def set_take_profit(self, symbol: str, side: str, quantity: float, trigger_price: float) -> Dict:
         """PM账户设置止盈条件单 (TAKE_PROFIT_MARKET - 触发后市价平仓)
-        
+
         side: 'SELL'=平多, 'BUY'=平空
-        trigger_price: 触发价格（涨到此价触发）
+        trigger_price: 触发价格(涨到此价触发)
         """
         result = self._papi_request('POST', '/papi/v1/um/algo/order', {
             'symbol': symbol,
@@ -328,10 +329,10 @@ class BinanceTrader:
     def set_take_profit_limit(self, symbol: str, side: str, quantity: float,
                               trigger_price: float, order_price: float) -> Dict:
         """PM账户设置止盈条件单 (TAKE_PROFIT - 触发后上限价单平仓)
-        
+
         side: 'SELL'=平多, 'BUY'=平空
-        trigger_price: 触发价格（涨到此价触发）
-        order_price: 下单价格（通常等于或略低于触发价）
+        trigger_price: 触发价格(涨到此价触发)
+        order_price: 下单价格(通常等于或略低于触发价)
         """
         return self._papi_request('POST', '/papi/v1/um/algo/order', {
             'symbol': symbol,
@@ -345,32 +346,34 @@ class BinanceTrader:
         })
 
     def get_conditional_orders(self, symbol: str = None) -> List[Dict]:
-        """查询PM账户活跃条件单（PM账户不支持此接口，始终返回空列表）"""
-        # PM账户 /papi/v1/um/conditional/openOrders 返回 404，无法查询
+        """查询PM账户活跃条件单(PM账户不支持此接口,始终返回空列表)"""
+        # PM账户 /papi/v1/um/conditional/openOrders 返回 404,无法查询
         # 使用 .conditional_orders.json 文件追踪活跃条件单
         return []
 
     def replace_conditional_order(self, symbol: str, side: str, quantity: int,
-                                   new_trigger_price: float, order_type: str = 'STOP_MARKET',
+                                   order_type: str = 'STOP_MARKET',
                                    algo_id: int = None) -> Dict:
-        """下新的条件单，自动追踪algo_id
-        
-        流程：1)从文件查找旧algo_id 2)尝试取消旧单 3)下新单 4)保存新algo_id
-        
+        """下新的条件单,自动追踪algo_id
+
+        流程:1)从文件查找旧algo_id 2)尝试取消旧单 3)下新单 4)保存新algo_id
+        触发价由本方法基于实时市价自动计算:
+          SELL(平多止损): 市价×0.99 (-1%)
+          BUY (平空止损): 市价×1.01 (+1%)
+
         Args:
-            symbol: 币种，如 NILUSDT
+            symbol: 币种,如 NILUSDT
             side: 'SELL'=平多仓/'BUY'=平空仓
-            quantity: 数量（整数）
-            new_trigger_price: 新触发价格
+            quantity: 数量(整数)
             order_type: 'STOP_MARKET'(止损) / 'TAKE_PROFIT_MARKET'(止盈)
-            algo_id: 可选，直接指定旧条件单ID
+            algo_id: 可选,直接指定旧条件单ID
         """
-        # 1. 查找旧algo_id（从文件追踪）
+        # 1. 查找旧algo_id(从文件追踪)
         orders = _load_conditional_orders()
         old_algo_id = algo_id
         if not old_algo_id:
             old_algo_id = orders.get(symbol, {}).get(side)
-        
+
         # 2. 尝试取消旧单
         if old_algo_id is not None:
             try:
@@ -378,27 +381,27 @@ class BinanceTrader:
                 print(f"[replace] ✅ 已取消旧条件单 algo_id={old_algo_id}")
             except Exception as e:
                 print(f"[replace] ⚠️ 取消旧单失败(可能已触发): {e}")
-        
-        # 3. 下新单
-        algo_type_map = {
-            'STOP_MARKET': 'STOP_MARKET',
-            'TAKE_PROFIT_MARKET': 'TAKE_PROFIT_MARKET',
-            'STOP': 'STOP',
-            'TAKE_PROFIT': 'TAKE_PROFIT',
-        }
-        algo_type_val = algo_type_map.get(order_type, 'STOP_MARKET')
-        
+
+        # 3. 获取实时价格作为触发价(SELL则低于市价0.1%,BUY则高于市价0.1%)
+        current_price = self.get_price(symbol)
+        if side.upper() == 'SELL':
+            trigger_price = _round_to_tick(current_price * 0.99, symbol)
+        else:
+            trigger_price = _round_to_tick(current_price * 1.01, symbol)
+        print(f"[replace] 当前市价={current_price} → 触发价={trigger_price}")
+
+        # 4. 下新单
         result = self._papi_request('POST', '/papi/v1/um/algo/order', {
             'symbol': symbol,
             'side': side,
             'algoType': 'CONDITIONAL',
-            'type': algo_type_val,
+            'type': order_type,
             'quantity': str(quantity),
-            'triggerPrice': str(new_trigger_price),
+            'triggerPrice': str(trigger_price),
             'reduceOnly': 'true',
         })
-        
-        # 4. 保存新algo_id到文件追踪
+
+        # 5. 保存新algo_id到文件追踪
         new_algo_id = result.get('algoId')
         if new_algo_id:
             orders = _load_conditional_orders()
@@ -407,8 +410,6 @@ class BinanceTrader:
             orders[symbol][side] = new_algo_id
             _save_conditional_orders(orders)
             print(f"[replace] ✅ 新条件单已设置 algo_id={new_algo_id}")
-        
-        return result
 
 
     def _clear_conditional_orders(self, symbol: str):
@@ -420,7 +421,7 @@ class BinanceTrader:
             print(f"[条件单] 已清除 {symbol} 追踪记录")
 
     def cancel_conditional_order(self, symbol: str, algo_id: int) -> Dict:
-        """取消PM账户条件单，并清除文件追踪记录"""
+        """取消PM账户条件单,并清除文件追踪记录"""
         result = self._papi_request('DELETE', '/papi/v1/um/algo/order', {
             'symbol': symbol,
             'algoId': str(algo_id),
@@ -436,24 +437,68 @@ class BinanceTrader:
         return result
 
     def get_klines(self, symbol: str, interval: str = "30m", limit: int = 100) -> List:
-        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/klines", endpoint='klines', params={'symbol': symbol, 'interval': interval, 'limit': limit})
-        return r.json()
+        """获取K线数据(fapi优先,papi作备选)"""
+        # fapi优先(国内pap访问很慢)
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/klines", endpoint='klines', params={'symbol': symbol, 'interval': interval, 'limit': limit})
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data
+        except Exception:
+            pass
+        # 降级 papi
+        try:
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/klines", endpoint='um/klines', params={'symbol': symbol, 'interval': interval, 'limit': limit})
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data
+        except Exception:
+            pass
+        return []
 
     def get_order_book(self, symbol: str, limit: int = 20) -> Dict:
-        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/depth", endpoint='depth', params={'symbol': symbol, 'limit': limit})
-        return r.json()
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/depth", endpoint='depth', params={'symbol': symbol, 'limit': limit})
+            return r.json()
+        except Exception:
+            pass
+        try:
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/depth", endpoint='um/depth', params={'symbol': symbol, 'limit': limit})
+            return r.json()
+        except Exception:
+            return {}
 
     def get_mark_price(self, symbol: str) -> float:
-        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/premiumIndex", endpoint='premiumIndex', params={'symbol': symbol})
-        return float(r.json()['markPrice'])
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/premiumIndex", endpoint='premiumIndex', params={'symbol': symbol})
+            return float(r.json()['markPrice'])
+        except Exception:
+            pass
+        try:
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/premiumIndex", endpoint='um/premiumIndex', params={'symbol': symbol})
+            return float(r.json()['markPrice'])
+        except Exception:
+            raise Exception(f"get_mark_price failed for {symbol}")
 
     def get_funding_rate(self, symbol: str) -> Dict:
-        r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/premiumIndex", endpoint='premiumIndex', params={'symbol': symbol})
-        data = r.json()
-        return {
-            'fundingRate': float(data.get('lastFundingRate', 0)) * 100,
-            'nextFundingTime': data.get('nextFundingTime', '')
-        }
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/premiumIndex", endpoint='premiumIndex', params={'symbol': symbol})
+            data = r.json()
+            return {
+                'fundingRate': float(data.get('lastFundingRate', 0)) * 100,
+                'nextFundingTime': data.get('nextFundingTime', '')
+            }
+        except Exception:
+            pass
+        try:
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/premiumIndex", endpoint='um/premiumIndex', params={'symbol': symbol})
+            data = r.json()
+            return {
+                'fundingRate': float(data.get('lastFundingRate', 0)) * 100,
+                'nextFundingTime': data.get('nextFundingTime', '')
+            }
+        except Exception:
+            return {'fundingRate': 0, 'nextFundingTime': ''}
 
     def get_long_short_ratio(self, symbol: str) -> Dict:
         try:
@@ -467,7 +512,30 @@ class BinanceTrader:
                 }
         except Exception:
             pass
+        try:
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/globalLongShortAccountRatio", endpoint='um/globalLongShortAccountRatio', params={'symbol': symbol, 'periodType': '1h', 'limit': 10})
+            data = r.json()
+            if isinstance(data, list) and data:
+                latest = data[-1]
+                return {
+                    'longRatio': float(latest.get('longAccount', 0)) * 100,
+                    'shortRatio': float(latest.get('shortAccount', 0)) * 100
+                }
+        except Exception:
+            pass
         return {'longRatio': 50, 'shortRatio': 50}
+
+    def get_ticker(self, symbol: str) -> Dict:
+        try:
+            r = _rl_request('GET', f"{self.fapi_url}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={'symbol': symbol})
+            return r.json()
+        except Exception:
+            pass
+        try:
+            r = _rl_request('GET', f"{self.papi_url}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={'symbol': symbol})
+            return r.json()
+        except Exception:
+            return {}
 
     # ---- 账户操作(PAPI = 统一账户)----
     def get_account(self) -> Dict:
@@ -500,8 +568,8 @@ class BinanceTrader:
                     'symbol': s,
                     'amount': v['qty'],  # 保留小数
                     'entryPrice': v['entry_price'],
-                    # 模拟模式不连接交易所，unrealizedProfit 无法实时计算
-                # 如需精确浮盈，请使用 SIMULATE=true + trader.py status 获取快照
+                    # 模拟模式不连接交易所,unrealizedProfit 无法实时计算
+                # 如需精确浮盈,请使用 SIMULATE=true + trader.py status 获取快照
                     'unrealizedProfit': None,
                     'leverage': v.get('leverage', 3),
                     'positionSide': v.get('side', 'LONG'),
@@ -510,7 +578,7 @@ class BinanceTrader:
             return result
         if is_portfolio_margin():
             try:
-                # 直接复用 account 数据中的 positions（避免多一次 HTTP 请求）
+                # 直接复用 account 数据中的 positions(避免多一次 HTTP 请求)
                 acct = _papi_get_account()
                 positions = acct.get('positions', []) if not symbol else [p for p in acct.get('positions', []) if p.get('symbol') == symbol]
                 result = []
@@ -549,10 +617,10 @@ class BinanceTrader:
         return positions
 
     def get_usdt_balance(self) -> float:
-        """获取USDT余额（PM 统一账户）
+        """获取USDT余额(PM 统一账户)
 
-        PM 账户：使用 /papi/v1/balance → totalWalletBalance（统一账户总余额）
-        非 PM 账户：使用标准现货 account → free balance
+        PM 账户:使用 /papi/v1/balance → totalWalletBalance(统一账户总余额)
+        非 PM 账户:使用标准现货 account → free balance
         """
         if SIMULATE:
             _load_sim_state()
@@ -586,7 +654,7 @@ class BinanceTrader:
         return 0.0
 
     def close_position(self, symbol: str, quantity: float = None) -> Dict:
-        """平仓（通用：多头用SELL，空头用BUY）"""
+        """平仓(通用:多头用SELL,空头用BUY)"""
         global _sim_balance, _sim_positions
         if SIMULATE and not _sim_positions:
             _load_sim_state()
@@ -800,12 +868,12 @@ class BinanceTrader:
         return result
 
 
-    # get_position_mode 已删除 — fapi接口不可用，PM账户用单向持仓无需查询
+    # get_position_mode 已删除 - fapi接口不可用,PM账户用单向持仓无需查询
 
 
 
     def close_long(self, symbol: str, quantity: float = None) -> Dict:
-        """平多仓 — 只接受LONG持仓(PAPI/fapi)"""
+        """平多仓 - 只接受LONG持仓(PAPI/fapi)"""
         if SIMULATE:
             global _sim_balance, _sim_positions
             _load_sim_state()
@@ -1142,7 +1210,7 @@ def detect_reversal_signals(symbol: str) -> Dict:
 
 # ========== LLM 分析模块 ==========
 def format_for_llm(symbol: str, action: str = "open") -> str:
-    """格式化 K 线原始数据供 LLM 分析（无指标、无方向提示）"""
+    """格式化 K 线原始数据供 LLM 分析(无指标、无方向提示)"""
 
     intervals = ["5m", "30m", "1h", "4h"]
     limits = {"5m": 12, "30m": 10, "1h": 12, "4h": 8}
@@ -1162,7 +1230,7 @@ def format_for_llm(symbol: str, action: str = "open") -> str:
     lines = [f"# {symbol} K线原始数据 ({action})", ""]
 
     for interval, klines in result.items():
-        # 检查是否为空或非列表（可能是rate limit错误响应）
+        # 检查是否为空或非列表(可能是rate limit错误响应)
         if not isinstance(klines, list) or not klines:
             lines.append(f"## {interval}: 无数据\n")
             continue
@@ -1554,7 +1622,7 @@ _WEIGHT_CONFIG = {
 }
 
 class RateLimiter:
-    """滑动窗口速率限制器 — 按权重计数"""
+    """滑动窗口速率限制器 - 按权重计数"""
     def __init__(self, max_weight_per_sec: int = 60, max_weight_per_min: int = 1200):
         self.max_weight_per_sec = max_weight_per_sec
         self.max_weight_per_min = max_weight_per_min
@@ -1563,7 +1631,7 @@ class RateLimiter:
         self._lock = __import__('threading').Lock()
 
     def acquire(self, weight: int, wait: bool = True, timeout: float = 30.0) -> bool:
-        """请求 weight 单位，必要时阻塞等待配额返回"""
+        """请求 weight 单位,必要时阻塞等待配额返回"""
         start = time.time()
         while True:
             with self._lock:
@@ -1580,7 +1648,7 @@ class RateLimiter:
                     return True
             if not wait:
                 return False
-            # 等待最近一个请求过期（优先等秒级）
+            # 等待最近一个请求过期(优先等秒级)
             with self._lock:
                 if self._sec_timestamps:
                     oldest_sec = min(t for t, _ in self._sec_timestamps)
@@ -1621,44 +1689,173 @@ def _binance_weight(endpoint: str, method: str = 'GET') -> int:
 
 
 def _rl_request(method: str, url: str, endpoint: str = '', **kwargs) -> requests.Response:
-    """带速率限制的 requests 封装 — 自动扣权重"""
+    """带速率限制的 requests 封装 - 自动扣权重,遇到限速自动退让"""
     weight = _binance_weight(endpoint or url)
-    # READ 超时较长
     kwargs.setdefault('timeout', 30 if method == 'GET' else 10)
     if not _rl.acquire(weight, wait=True, timeout=30.0):
         raise Exception(f"Rate limit timeout after 30s (weight={weight}) for {endpoint or url}")
-    r = requests.request(method, url, **kwargs)
-    return r
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.request(method, url, **kwargs)
+            # 遇到限速(429/418)- 等待一段时间后重试
+            if r.status_code in (418, 429) or (r.status_code == 418):
+                wait_sec = (attempt + 1) * 2  # 2s, 4s, 6s
+                print(f"  ⚠️ Rate limited ({r.status_code}) for {endpoint}, waiting {wait_sec}s...", file=sys.stderr)
+                time.sleep(wait_sec)
+                continue
+            return r
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+            continue
+    raise last_err
 
 
 def _rate_limit():
-    """旧兼容函数 — 扣1个默认权重"""
+    """旧兼容函数 - 扣1个默认权重"""
     _rl.acquire(_WEIGHT_CONFIG['default'][0])
 
 
 def _get_klines_raw(symbol: str, interval: str, limit: int) -> List:
-    """Get raw klines without computing indicators (with retry)"""
+    """Get raw klines without computing indicators (with retry, PM-safe)"""
     _rate_limit()
+    # PM账户优先papi公开端点,降级fapi
     for attempt in range(3):  # 最多重试3次
         try:
+            # 优先 papi(PM账户无需签名)
             r = requests.get(
-                f"{FAPI_URL}/fapi/v1/klines",
+                f"{PAPI_URL}/papi/v1/um/klines",
                 params={'symbol': symbol, 'interval': interval, 'limit': limit},
-                timeout=10
+                timeout=10,
+                verify=certifi.where()
             )
             data = r.json()
             if isinstance(data, list) and len(data) > 0:
                 return data
-            # 空数据,重试
+            # papi失败,降级fapi
+        except Exception:
+            pass
+        # 降级fapi
+        try:
+            r = requests.get(
+                f"{FAPI_URL}/fapi/v1/klines",
+                params={'symbol': symbol, 'interval': interval, 'limit': limit},
+                timeout=10,
+                verify=certifi.where()
+            )
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data
             time.sleep(0.2)
             continue
         except Exception as e:
-            # 网络错误,重试
             time.sleep(0.3)
             continue
     # 3次都失败,打印警告
     print(f"  ⚠️ {symbol} {interval} K线获取失败", file=sys.stderr)
     return []
+
+
+def _round_to_tick(price: float, symbol: str) -> float:
+    """将价格对齐到 tickSize 精度,避免 Precision over maximum 错误
+
+    Bug fix: 之前返回的 float 有浮点误差(0.028460000000000003),
+    现在用字符串格式化对齐到 tickSize 指定的小数位数。
+    优先 fapi exchangeInfo(更快),papi exchangeInfo 降级。
+    """
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"{FAPI_URL}/fapi/v1/exchangeInfo",
+                timeout=10,
+                verify=certifi.where()
+            )
+            if r.status_code != 200:
+                raise Exception(f"status {r.status_code}")
+            data = r.json()
+            sym_data = next((s for s in data.get('symbols', []) if s.get('symbol') == symbol), None)
+            if not sym_data:
+                raise Exception(f"symbol {symbol} not in exchangeInfo")
+            for f in sym_data.get('filters', []):
+                if f.get('filterType') == 'PRICE_FILTER':
+                    tick_str = f['tickSize']
+                    tick = float(tick_str)
+                    # 计算 tickSize 的小数位数(如 0.0000100 → 5位)
+                    decimals = 0
+                    if '.' in tick_str:
+                        decimals = len(tick_str.rstrip('0').split('.')[1])
+                    # round 后用字符串格式化消除浮点误差
+                    raw = round(price / tick) * tick
+                    return float(f"{raw:.{decimals}f}")
+            break
+        except Exception:
+            pass
+        try:
+            # papi 降级
+            r = requests.get(
+                f"{PAPI_URL}/papi/v1/um/exchangeInfo",
+                params={'symbol': symbol},
+                timeout=10,
+                verify=certifi.where()
+            )
+            if r.status_code == 200:
+                data = r.json()
+                sym_data = next((s for s in data.get('symbols', []) if s.get('symbol') == symbol), None)
+                if sym_data:
+                    for f in sym_data.get('filters', []):
+                        if f.get('filterType') == 'PRICE_FILTER':
+                            tick_str = f['tickSize']
+                            tick = float(tick_str)
+                            decimals = 0
+                            if '.' in tick_str:
+                                decimals = len(tick_str.rstrip('0').split('.')[1])
+                            raw = round(price / tick) * tick
+                            return float(f"{raw:.{decimals}f}")
+                break
+        except Exception:
+            pass
+        time.sleep(0.3 * (attempt + 1))
+    # 兜底:用 tickSize 0.0000100 → 5位小数
+    return float(f"{price:.5f}")
+
+
+def _round_qty_to_step(qty: float, symbol: str) -> float:
+    """将数量对齐到 stepSize 精度(避免 QTY precision 错误)"""
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"{FAPI_URL}/fapi/v1/exchangeInfo",
+                timeout=10,
+                verify=certifi.where()
+            )
+            if r.status_code != 200:
+                raise Exception(f"status {r.status_code}")
+            data = r.json()
+            sym_data = next((s for s in data.get('symbols', []) if s.get('symbol') == symbol), None)
+            if not sym_data:
+                raise Exception(f"symbol {symbol} not in exchangeInfo")
+            for f in sym_data.get('filters', []):
+                if f.get('filterType') == 'LOT_SIZE':
+                    step_str = f['stepSize']
+                    step = float(step_str)
+                    decimals = 0
+                    if '.' in step_str:
+                        decimals = len(step_str.rstrip('0').split('.')[1])
+                    raw = round(qty / step) * step
+                    return float(f"{raw:.{decimals}f}")
+            break
+        except Exception:
+            pass
+        time.sleep(0.3 * (attempt + 1))
+    # 兜底
+    return float(f"{qty:.1f}")
+
+
+def _format_klines_for_llm(klines: List, interval: str) -> str:
+    """Format klines into LLM-readable text"""
+
 
 def _format_klines_for_llm(klines: List, interval: str) -> str:
     """Format klines into LLM-readable text"""
@@ -1690,7 +1887,7 @@ def _format_klines_for_llm(klines: List, interval: str) -> str:
 
 def llm_analyze_batch(coins: List[Dict]) -> Dict[str, Dict]:
     """
-    打印原始K线数据供LLM分析，程序不做任何计算
+    打印原始K线数据供LLM分析,程序不做任何计算
     """
     for c in coins:
         sym = c['symbol']
@@ -1734,10 +1931,20 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
     except:
         pass
 
-    # 获取可交易币种(只取 TRADING 状态)
+    # 获取可交易币种(只取 TRADING 状态, fapi优先)
     _rate_limit()
-    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo')
-    exchange_info = r.json()
+    try:
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo', timeout=15)
+        exchange_info = r.json()
+        if not isinstance(exchange_info, dict) or 'symbols' not in exchange_info:
+            raise Exception("fapi exchangeInfo invalid")
+    except Exception:
+        try:
+            r = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/exchangeInfo", endpoint='um/exchangeInfo', timeout=15)
+            exchange_info = r.json()
+        except Exception:
+            print(f"❌ exchangeInfo 获取失败")
+            return []
     tradeable_symbols = set()
     for s in exchange_info.get('symbols', []):
         if s.get('status') == 'TRADING' and s.get('quoteAsset') == 'USDT':
@@ -1751,60 +1958,75 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
                         break
     print(f"可交易币种: {len(tradeable_symbols)}")
 
-    # 获取24h行情
+    # 获取24h行情(fapi优先,pap作备选)
     _rate_limit()
-    r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": top_n * 3, "sortBy": "priceChangePercent", "sortType": "DESC"})
-    all_tickers_raw = r.json()
+    try:
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": top_n * 3, "sortBy": "priceChangePercent", "sortType": "DESC"}, timeout=15)
+        all_tickers_raw = r.json()
+        if isinstance(all_tickers_raw, dict) and all_tickers_raw.get('code') == -1003:
+            raise Exception("rate limited")
+        if not isinstance(all_tickers_raw, list):
+            raise Exception("not a list")
+    except Exception:
+        try:
+            r = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={"limit": top_n * 3, "sortBy": "priceChangePercent", "sortType": "DESC"}, timeout=15)
+            all_tickers_raw = r.json()
+            if isinstance(all_tickers_raw, dict) and all_tickers_raw.get('code') == -1003:
+                raise Exception("rate limited")
+        except Exception:
+            # 全部失败
+            print(f"❌ ticker/24hr 获取失败")
+            return []
+    all_tickers = all_tickers_raw
     # 处理正常响应(list)或rate limit错误(dict)
-    if isinstance(all_tickers_raw, dict) and all_tickers_raw.get('code') == -1003:
-        print(f"⚠️ Binance 24hr API 速率限制，切换到本地排序模式")
-        # 回退：获取全部24hr数据用本地Python排序
+    if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+        print(f"⚠️ Binance 24hr API 速率限制,切换到本地排序模式")
+        # 回退:获取全部24hr数据用本地Python排序
         _rate_limit()
-        r2 = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200})
-        all_tickers = r2.json()
-        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
-            print(f"⚠️ Binance API 全面受限，等待60秒后重试")
-            time.sleep(60)
-            r2 = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200})
+        try:
+            r2 = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200}, timeout=15)
             all_tickers = r2.json()
-        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
-            print(f"⚠️ Binance API 仍然受限，尝试 PAPI 末端...")
-            _rate_limit()
+            if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+                raise Exception("rate limited")
+        except Exception:
             try:
-                r3 = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={"limit": 200})
-                papi_data = r3.json()
-                if isinstance(papi_data, list):
-                    all_tickers = papi_data
-                    print(f"⚠️ PAPI 末端成功，获取 {len(papi_data)} 条")
-            except Exception as e:
-                print(f"⚠️ PAPI 也失败: {e}")
-        # 最终检查
+                r2 = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={"limit": 200}, timeout=15)
+                all_tickers = r2.json()
+                if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+                    raise Exception("rate limited")
+            except Exception:
+                pass
         if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
-            print(f"⚠️ 所有API均受限，尝试用 exchangeInfo + klines 备选方案...")
-            # 备选：直接从各币种K线数据获取价格信息
-            _rate_limit()
+            print(f"⚠️ Binance API 全面受限,等待60秒后重试")
+            time.sleep(60)
             try:
-                # 获取 BTCUSDT 价格作为市场参考
-                btc_r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/price", endpoint='ticker/price', params={"symbol": "BTCUSDT"})
+                r2 = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200}, timeout=15)
+                all_tickers = r2.json()
+            except Exception:
+                try:
+                    r2 = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={"limit": 200}, timeout=15)
+                    all_tickers = r2.json()
+                except Exception:
+                    pass
+        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+            print(f"⚠️ 所有API均受限,尝试备选方案...")
+            try:
+                btc_r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/price", endpoint='ticker/price', params={"symbol": "BTCUSDT"}, timeout=10)
                 btc_data = btc_r.json()
                 if isinstance(btc_data, dict) and btc_data.get('symbol'):
-                    # 用 BTC 涨幅近似市场情绪
                     btc_change = 0.0
                 else:
                     btc_change = 0.0
             except:
                 btc_change = 0.0
-            print(f"⚠️ API 受限期间无法获取完整市场数据，请稍后重试")
-            print(f"当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}，Binance 限制可能持续 1-2 分钟")
-            # 返回空结果，程序会优雅退出
+            print(f"⚠️ API 受限期间无法获取完整市场数据,请稍后重试")
+            print(f"当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')},Binance 限制可能持续 1-2 分钟")
             candidates = []
             return candidates
         usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
-        # 本地按涨幅排序
         usdt_pairs.sort(key=lambda x: float(x.get('priceChangePercent', 0) or 0), reverse=True)
         usdt_pairs = usdt_pairs[:top_n * 3]
     else:
-        all_tickers = all_tickers_raw
         usdt_pairs = [t for t in all_tickers if isinstance(t, dict) and t.get('symbol', '').endswith('USDT')]
     print(f"Binance sorted: {len(usdt_pairs)} candidates")
 
@@ -1860,11 +2082,19 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
             klines_30m = _get_klines_raw(sym, '30m', 10)
             klines_1h  = _get_klines_raw(sym, '1h', 12)
             klines_4h  = _get_klines_raw(sym, '4h', 8)
+            # 获取当前价格(get_ticker 的 lastPrice 最精确,用于止损/止盈)
+            try:
+                r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={'symbol': sym}, timeout=8)
+                data = r.json()
+                current_price = float(data.get('lastPrice', 0))
+            except Exception:
+                current_price = 0.0
             return sym, {
                 'klines_5m':  klines_5m,
                 'klines_30m': klines_30m,
                 'klines_1h':  klines_1h,
                 'klines_4h':  klines_4h,
+                'current_price': current_price,
             }
         except Exception:
             return sym, {}
@@ -1893,52 +2123,44 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
     return candidates
 
 def get_market_data(symbol: str, kline_count: int = 15) -> Dict:
-    """获取市场数据 - 多周期K线格式"""
+    """获取市场数据(优化:减少API调用,只取30m+1h两周期)"""
     trader = BinanceTrader()
-
-    # 多周期K线数据 - 需要足够数据计算指标
-    intervals = {'5m': 12, '30m': 10, '1h': 12, '4h': 8}
+    # 优化:只取30m(主指标)+ 1h(趋势验证),limit 50
     klines_data = {}
-    for iv_name, iv_min in intervals.items():
-        klines_data[iv_name] = trader.get_klines(symbol, iv_name, limit=100)
-
-    # 提取价格数据
-    closes = [float(k[4]) for k in klines_data['30m']]
-    highs = [float(k[2]) for k in klines_data['30m']]
-    lows = [float(k[3]) for k in klines_data['30m']]
-    volumes = [float(k[5]) for k in klines_data['30m']]
-
-    # 技术指标
+    for iv_name in ('30m', '1h'):
+        klines_data[iv_name] = trader.get_klines(symbol, iv_name, limit=50)
+    kl30 = klines_data.get('30m', [])
+    if not kl30:
+        raise Exception(f"无法获取 {symbol} 30m K线数据")
+    closes = [float(k[4]) for k in kl30]
+    highs = [float(k[2]) for k in kl30]
+    lows = [float(k[3]) for k in kl30]
+    volumes = [float(k[5]) for k in kl30]
     rsi = TechnicalIndicators.calculate_rsi(closes)
     macd = TechnicalIndicators.calculate_macd(closes)
     bb = TechnicalIndicators.calculate_bollinger_bands(closes)
-    atr = TechnicalIndicators.calculate_atr(klines_data['30m'])
+    atr = TechnicalIndicators.calculate_atr(kl30)
     ma5 = TechnicalIndicators.calculate_ma(closes, 5)
     ma20 = TechnicalIndicators.calculate_ma(closes, 20)
-
-    # 最新价格
-    current_price = closes[-1]
-    current_price_raw = None
+    # ⭐ 用 get_ticker 的 lastPrice(最精确),不用 K线收盘价
+    try:
+        ticker = trader.get_ticker(symbol)
+        current_price = float(ticker.get('lastPrice', closes[-1]))
+    except Exception:
+        current_price = closes[-1]
     atr_percent = (atr / current_price * 100) if current_price > 0 else 0
-
-    # 成交量变化
     avg_volume = sum(volumes[-5:]) / 5
     current_volume = volumes[-1]
     volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
-
-    # 资金费率
     try:
         funding = trader.get_funding_rate(symbol)
         funding_rate = funding.get('fundingRate', 0)
-    except:
+    except Exception:
         funding_rate = 0
-
-    # 多空比
     try:
         ls_ratio = trader.get_long_short_ratio(symbol)
-    except:
+    except Exception:
         ls_ratio = {'longRatio': 50, 'shortRatio': 50}
-
     return {
         'symbol': symbol,
         'current_price': current_price,
@@ -1991,13 +2213,27 @@ def print_market_data(data: Dict):
     print(f"\n{'='*60}")
     print(f"📊 {data['symbol']} 市场数据")
     print(f"{'='*60}")
-    # 直接从API获取原始价格（保持精度）
+    # 直接从API获取原始价格(保持精度, PM-safe)
     import requests
     try:
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={data['symbol']}")
-        raw_price = r.json()['price']
-    except:
-        raw_price = str(data['current_price'])
+        r = requests.get(
+            f"{PAPI_URL}/papi/v1/um/ticker/price",
+            params={'symbol': data['symbol']},
+            timeout=10,
+            verify=certifi.where()
+        )
+        raw_price = r.json().get('price', str(data['current_price']))
+    except Exception:
+        try:
+            r = requests.get(
+                f"{FAPI_URL}/fapi/v1/ticker/price",
+                params={'symbol': data['symbol']},
+                timeout=10,
+                verify=certifi.where()
+            )
+            raw_price = r.json().get('price', str(data['current_price']))
+        except Exception:
+            raw_price = str(data['current_price'])
     print(raw_price)
     sign = '+' if data['change_24h'] >= 0 else ''
     print(f"24h涨幅: {sign}{data['change_24h']:.2f}%")
@@ -2088,7 +2324,7 @@ def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     if step_size and step_size > 0:
         quantity = round(round(quantity / step_size) * step_size, 8)
     else:
-        quantity = round(quantity, 8)  # 无法获取step_size时，保留8位小数
+        quantity = round(quantity, 8)  # 无法获取step_size时,保留8位小数
     if quantity <= 0:
         quantity = 0.00000001
 
@@ -2106,16 +2342,16 @@ def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     # 判断是否成功
     if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
         print(f"\n✅ 开空仓成功")
-        # ===== 自动设置止损（杠杆前1%，止盈由LLM设置）=====
+        # ===== 自动设置止损(杠杆前1%,止盈由LLM设置)=====
         import math
         qty_int = max(1, math.ceil(quantity))
-        sl_trigger = round(price * 1.02, 6)   # 止损: 涨2%触发（市价平）
+        sl_trigger = round(price * 1.02, 6)   # 止损: 涨2%触发(市价平)
         try:
             trader.set_stop_loss(symbol, 'BUY', qty_int, sl_trigger)
-            print(f"  ✅ 止损 @ ${sl_trigger} (涨1%触发，杠杆前1%止损")
+            print(f"  ✅ 止损 @ ${sl_trigger} (涨1%触发,杠杆前1%止损")
         except Exception as e:
             print(f"  ⚠️ 止损设置失败: {e}")
-        print(f"  ℹ️ 止盈由LLM分析后设置")
+        print(f"  i️ 止盈由LLM分析后设置")
     else:
         print(f"\n❌ 开空仓失败: {result}")
     return result
@@ -2193,16 +2429,16 @@ def do_open_long(symbol: str, margin: float, leverage: int) -> Dict:
     # 判断是否成功
     if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
         print(f"\n✅ 开多仓成功")
-        # ===== 自动设置止损（杠杆前1%，止盈由LLM设置）=====
+        # ===== 自动设置止损(杠杆前1%,止盈由LLM设置)=====
         import math
         qty_int = max(1, math.ceil(quantity))
-        sl_trigger = round(price * 0.98, 6)   # 止损: 跌2%触发（市价平）
+        sl_trigger = round(price * 0.98, 6)   # 止损: 跌2%触发(市价平)
         try:
             trader.set_stop_loss(symbol, 'SELL', qty_int, sl_trigger)
-            print(f"  ✅ 止损 @ ${sl_trigger} (跌1%触发，杠杆前1%止损")
+            print(f"  ✅ 止损 @ ${sl_trigger} (跌1%触发,杠杆前1%止损")
         except Exception as e:
             print(f"  ⚠️ 止损设置失败: {e}")
-        print(f"  ℹ️ 止盈由LLM分析后设置")
+        print(f"  i️ 止盈由LLM分析后设置")
     else:
         print(f"\n❌ 开多仓失败: {result}")
     return result
@@ -2267,7 +2503,7 @@ def main():
     scan_all_parser.add_argument('--top', type=int, default=20, help='取前N个高波动币种')
     scan_all_parser.add_argument('--min-vol', type=float, default=3.0, help='最低1h波动率%')
     scan_all_parser.add_argument('--klines', type=int, default=30, help='给多少个候选拿K线')
-    scan_all_parser.add_argument('--log', type=str, default=None, help='日志文件（覆盖模式，默认stdout）')
+    scan_all_parser.add_argument('--log', type=str, default=None, help='日志文件(覆盖模式,默认stdout)')
 
     # market
     market_parser = subparsers.add_parser('market', help='市场数据')
@@ -2305,21 +2541,20 @@ def main():
     llm_hold_parser = subparsers.add_parser('llm-hold', help='LLM分析持仓')
     llm_hold_parser.add_argument('--symbol', type=str, required=True, help='币种')
 
-    # replace-order: 替换条件单（自动取消旧单+下新单）
+    # replace-order: 替换条件单(自动取消旧单+下新单)
     replace_parser = subparsers.add_parser('replace-order', help='替换条件单(自动取消旧单后下新单)')
     replace_parser.add_argument('--symbol', type=str, required=True, help='币种')
     replace_parser.add_argument('--side', type=str, required=True, help="SELL=平多/BUY=平空")
-    replace_parser.add_argument('--price', type=str, required=True, help='新触发价格或百分比，如 50000 或 1.01%（相对于当前价，自动确定方向）')
     replace_parser.add_argument('--type', type=str, default='STOP_MARKET',
                                   help="STOP_MARKET/TAKE_PROFIT_MARKET/STOP/TAKE_PROFIT")
     replace_parser.add_argument('--algo-id', type=int, default=None,
-                                  help='旧条件单ID（可选）')
+                                  help='旧条件单ID(可选)')
 
     # cancel-conditionals: 取消指定币种全部追踪的委托单
     cancel_cond_parser = subparsers.add_parser('cancel-conditionals', help='取消指定币种全部追踪的委托单')
     cancel_cond_parser.add_argument('--symbol', type=str, required=True, help='币种')
     cancel_cond_parser.add_argument('--side', type=str, default=None,
-                                  help='SELL=平多/BUY=平空（可选，不填则取消该币种全部）')
+                                  help='SELL=平多/BUY=平空(可选,不填则取消该币种全部)')
 
     args = parser.parse_args()
 
@@ -2404,41 +2639,21 @@ def main():
 
     elif args.command == 'replace-order':
         trader = BinanceTrader()
-        # 优先用命令行 --algo-id，其次从文件查找
+        # 优先用命令行 --algo-id,其次从文件查找
         algo_id = args.algo_id
         if not algo_id:
             orders = _load_conditional_orders()
             algo_id = orders.get(args.symbol, {}).get(args.side)
-        # 获取数量（优先查持仓，其次从文件）
+        # 获取数量(优先查持仓,其次从文件)
         positions = trader.get_positions(args.symbol)
         if positions:
             qty = int(max(1, abs(positions[0]['amount'])))
         else:
-            # 无持仓时qty传1（条件单数量不影响实际平仓）
+            # 无持仓时qty传1(条件单数量不影响实际平仓)
             qty = 1
-        # 解析 --price：支持绝对价格或百分比
-        # 百分比基于：不含杠杆的浮盈%（相对于入场价）
-        # SELL（平多）: --price=2% → 触发价 = 入场价 × (1 - 2/100)，即 -2% 浮亏止损
-        # BUY  （平空）: --price=2% → 触发价 = 入场价 × (1 + 2/100)，即 +2% 浮亏止损
-        price_arg = args.price
-        if isinstance(price_arg, str) and price_arg.endswith('%'):
-            pct = float(price_arg[:-1])
-            if not positions:
-                print(f"❌ 无持仓，无法用百分比设置止损（需要入场价）")
-                return
-            entry_price = float(positions[0].get('entryPrice', 0))
-            if entry_price <= 0:
-                print(f"❌ 入场价无效: {entry_price}")
-                return
-            if args.side.upper() == 'SELL':
-                trigger_price = entry_price * (1 - pct / 100)
-            else:  # BUY
-                trigger_price = entry_price * (1 + pct / 100)
-            print(f"[replace-order] 入场价={entry_price} → 触发价={trigger_price:.6f} ({pct}%{'亏损' if args.side.upper()=='SELL' else '亏损'}) [基于入场价]")
-        else:
-            trigger_price = float(price_arg)
+        # 触发价由replace_conditional_order内部基于实时市价自动计算
         result = trader.replace_conditional_order(
-            args.symbol, args.side, qty, trigger_price, args.type, algo_id
+            args.symbol, args.side, qty, args.type, algo_id
         )
         print(f"✅ 条件单已替换: {result}")
 
