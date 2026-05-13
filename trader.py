@@ -112,16 +112,17 @@ _is_pm_account = None
 
 def _papi_get_account(retries: int = 3) -> Dict:
     """直接用 requests 发 papi 签名请求获取账户信息（不依赖 BinanceClient），带重试"""
-    ts = str(int(time.time() * 1000))
-    query = f"timestamp={ts}"
-    signature = hmac.new(
-        API_SECRET.encode(), query.encode(), hashlib.sha256
-    ).hexdigest()
-    url = f"{PAPI_URL}/papi/v1/um/account?{query}&signature={signature}"
-    headers = {"X-MBX-APIKEY": API_KEY}
     last_err = None
     for attempt in range(retries):
         try:
+            ts = str(int(time.time() * 1000))
+            recv = '5000'
+            query = f"timestamp={ts}&recvWindow={recv}"
+            signature = hmac.new(
+                API_SECRET.encode(), query.encode(), hashlib.sha256
+            ).hexdigest()
+            url = f"{PAPI_URL}/papi/v1/um/account?{query}&signature={signature}"
+            headers = {"X-MBX-APIKEY": API_KEY}
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code != 200:
                 raise Exception(f"papi account Error {r.status_code}: {r.text}")
@@ -133,23 +134,29 @@ def _papi_get_account(retries: int = 3) -> Dict:
     raise last_err
 
 
+_pm_check_retries = 0
+
 def is_portfolio_margin() -> bool:
-    """检测是否为 Portfolio Margin 账户（检查 tradeGroupId 字段）"""
-    global _is_pm_account
-    if _is_pm_account is not None:
-        return _is_pm_account
+    """检测是否为 Portfolio Margin 账户（检查 tradeGroupId 字段）
+    遇到异常时不缓存结果，持续重试（避免网络抖动导致永久误判）"""
+    global _is_pm_account, _pm_check_retries
+    if _is_pm_account is True:
+        return True
     try:
         acct = _papi_get_account()
-        # PM 账户响应结构: {tradeGroupId, assets, positions}
-        # 非 PM 账户 papi 会报错（无权限）
         if "tradeGroupId" in acct or "assets" in acct:
             _is_pm_account = True
+            _pm_check_retries = 0
             print(f"[PM] 检测到 Portfolio Margin 账户 (tradeGroupId={acct.get('tradeGroupId')})", file=sys.stderr)
         else:
             _is_pm_account = False
     except Exception:
-        _is_pm_account = False
-    return _is_pm_account
+        _pm_check_retries += 1
+        if _pm_check_retries >= 3:
+            _is_pm_account = False
+        else:
+            pass
+    return _is_pm_account is True
 
 # ========== Binance API 封装(PAPI 版)==========
 class BinanceTrader:
@@ -185,6 +192,7 @@ class BinanceTrader:
     def _papi_sign(self, params: Dict) -> str:
         """PAPI 签名"""
         params['timestamp'] = str(int(time.time() * 1000))
+        params['recvWindow'] = 5000
         query = '&'.join([f'{k}={v}' for k, v in sorted(params.items())])
         return query + '&signature=' + hmac.new(
             self.api_secret.encode(), query.encode(), hashlib.sha256
@@ -1137,7 +1145,7 @@ def format_for_llm(symbol: str, action: str = "open") -> str:
     """格式化 K 线原始数据供 LLM 分析（无指标、无方向提示）"""
 
     intervals = ["5m", "30m", "1h", "4h"]
-    limits = {"5m": 10, "30m": 40, "1h": 80, "4h": 6}
+    limits = {"5m": 12, "30m": 10, "1h": 12, "4h": 8}
     result = {}
 
     for interval in intervals:
@@ -1189,7 +1197,7 @@ def _fetch_klines_multi(symbol: str, intervals: List[str] = None) -> Dict:
     """并发拉取多周期K线,返回原始数据给LLM分析"""
     if intervals is None:
         intervals = ["5m", "30m", "1h", "4h"]
-    limits = {"5m": 26, "30m": 16, "1h": 24, "4h": 6}
+    limits = {"5m": 12, "30m": 10, "1h": 12, "4h": 8}
     results = {}
 
     def _fetch(interval: str):
@@ -1848,10 +1856,10 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
     def fetch_coin_klines(c):
         sym = c['symbol']
         try:
-            klines_5m  = _get_klines_raw(sym, '5m', 26)
-            klines_30m = _get_klines_raw(sym, '30m', 16)
-            klines_1h  = _get_klines_raw(sym, '1h', 24)
-            klines_4h  = _get_klines_raw(sym, '4h', 6)
+            klines_5m  = _get_klines_raw(sym, '5m', 12)
+            klines_30m = _get_klines_raw(sym, '30m', 10)
+            klines_1h  = _get_klines_raw(sym, '1h', 12)
+            klines_4h  = _get_klines_raw(sym, '4h', 8)
             return sym, {
                 'klines_5m':  klines_5m,
                 'klines_30m': klines_30m,
@@ -1889,7 +1897,7 @@ def get_market_data(symbol: str, kline_count: int = 15) -> Dict:
     trader = BinanceTrader()
 
     # 多周期K线数据 - 需要足够数据计算指标
-    intervals = {'5m': 100, '30m': 100, '1h': 100, '4h': 100}
+    intervals = {'5m': 12, '30m': 10, '1h': 12, '4h': 8}
     klines_data = {}
     for iv_name, iv_min in intervals.items():
         klines_data[iv_name] = trader.get_klines(symbol, iv_name, limit=100)
