@@ -385,9 +385,9 @@ class BinanceTrader:
         # 3. 获取实时价格作为触发价(SELL则低于市价0.1%,BUY则高于市价0.1%)
         current_price = self.get_price(symbol)
         if side.upper() == 'SELL':
-            trigger_price = _round_to_tick(current_price * 0.99, symbol)
+            trigger_price = _round_to_tick(current_price * 0.985, symbol)
         else:
-            trigger_price = _round_to_tick(current_price * 1.01, symbol)
+            trigger_price = _round_to_tick(current_price * 1.015, symbol)
         print(f"[replace] 当前市价={current_price} → 触发价={trigger_price}")
 
         # 4. 下新单
@@ -1212,8 +1212,8 @@ def detect_reversal_signals(symbol: str) -> Dict:
 def format_for_llm(symbol: str, action: str = "open") -> str:
     """格式化 K 线原始数据供 LLM 分析(无指标、无方向提示)"""
 
-    intervals = ["5m", "30m", "1h", "4h"]
-    limits = {"5m": 12, "30m": 10, "1h": 12, "4h": 8}
+    intervals = ["1h", "30m"]
+    limits = {"1h": 12, "30m": 24}
     result = {}
 
     for interval in intervals:
@@ -1264,8 +1264,8 @@ def do_llm_analysis(symbol: str, action: str = "open"):
 def _fetch_klines_multi(symbol: str, intervals: List[str] = None) -> Dict:
     """并发拉取多周期K线,返回原始数据给LLM分析"""
     if intervals is None:
-        intervals = ["5m", "30m", "1h", "4h"]
-    limits = {"5m": 12, "30m": 10, "1h": 12, "4h": 8}
+        intervals = ["1h", "30m"]
+    limits = {"1h": 12, "30m": 24}
     results = {}
 
     def _fetch(interval: str):
@@ -1329,7 +1329,7 @@ def scan_short_candidates(min_change: float = 10) -> List[Dict]:
         if change_24h < min_change:
             return None
         try:
-            klines_data = _fetch_klines_multi(symbol)
+            klines_data = _fetch_klines_multi(symbol, intervals=["1h", "30m"])
             return {
                 'symbol': symbol,
                 'price': float(ticker.get('lastPrice', 0)),
@@ -1358,7 +1358,7 @@ def scan_short_candidates(min_change: float = 10) -> List[Dict]:
         print(f"\n{'='*60}")
         print(f"[做空候选] {c['symbol']} | 价格={c['price']:.6g} | 24h涨幅={c['change_24h']:+.2f}% | 24h成交额={c['volume_24h']:.0f}U")
         print(f"{'='*60}")
-        for iv in ["5m", "30m", "1h", "4h"]:
+        for iv in ["1h", "30m"]:
             kl = c['klines'].get(iv, [])
             print(_format_klines_raw(kl, iv))
 
@@ -1900,7 +1900,7 @@ def llm_analyze_batch(coins: List[Dict]) -> Dict[str, Dict]:
 
         print(f"[COIN] {sym} | Price={price} | 24h={change:+.2f}% | Vol={vol}% | Pos={pos:.0f}%")
 
-        for interval, key in [('5m', 'klines_5m'), ('30m', 'klines_30m'), ('1h', 'klines_1h'), ('4h', 'klines_4h')]:
+        for interval, key in [('1h', 'klines_1h'), ('30m', 'klines_30m')]:
             kls = c.get(key, [])
             if kls:
                 print(_format_klines_for_llm(kls, interval))
@@ -2071,18 +2071,15 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
     print(f"After vol filter: {len(candidates)} >= {min_vol}% | 取前{top_n}名 | K线候选{top_klines}个")
     print(f"\nFetching klines for all coins (rate-limit: 0.1s/req)...\n")
 
-    # 批量获取K线(每次2个API:5m+30m),避免超限
+    # 批量获取K线(1h+30m),避免超限
     # top_klines 控制实际取K线的数量
     kline_coins = top_vol[:top_klines]
 
     def fetch_coin_klines(c):
         sym = c['symbol']
         try:
-            klines_5m  = _get_klines_raw(sym, '5m', 12)
-            klines_30m = _get_klines_raw(sym, '30m', 10)
-            klines_1h  = _get_klines_raw(sym, '1h', 12)
-            klines_4h  = _get_klines_raw(sym, '4h', 8)
-            # 获取当前价格(get_ticker 的 lastPrice 最精确,用于止损/止盈)
+            klines_1h  = _get_klines_raw(sym, '1h',  12)
+            klines_30m = _get_klines_raw(sym, '30m', 8)
             try:
                 r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={'symbol': sym}, timeout=8)
                 data = r.json()
@@ -2090,10 +2087,8 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
             except Exception:
                 current_price = 0.0
             return sym, {
-                'klines_5m':  klines_5m,
-                'klines_30m': klines_30m,
-                'klines_1h':  klines_1h,
-                'klines_4h':  klines_4h,
+                'klines_1h':   klines_1h,
+                'klines_30m':  klines_30m,
                 'current_price': current_price,
             }
         except Exception:
@@ -2121,6 +2116,372 @@ def scan_volatility_top(top_n: int = 10, min_vol: float = 3.0, top_klines: int =
             c['confidence'] = 0
 
     return candidates
+
+def scan_pick_top(top_n: int = 30, min_vol_24h: float = 3000000,
+                  min_volatility: float = 1.5, max_volatility: float = 30.0,
+                  round1_count: int = 30) -> List[Dict]:
+    """
+    scan-pick: 两轮筛选
+
+    第一轮: 从全市场 ticker/24hr 筛选:
+      - quoteVolume >= min_vol_24h (默认300万U)
+      - 24h波动率 [min_volatility%, max_volatility%] (默认1.5%~30%)
+      - 按 quoteVolume * volatility 取前 round1_count 名
+
+    第二轮: 直接拉1h+30m K线,按第一轮排序输出(程序不做额外筛选)
+    输出: 纯原始数据(24h行情 + 1h/30m K线),程序不做任何评分/指标
+    """
+    print(f"\n{'='*70}")
+    print(f"SCAN-PICK - 量价筛选 (top={top_n}, min_vol_24h={min_vol_24h:.0f}, volatility={min_volatility}-{max_volatility}%)")
+    print(f"{'='*70}")
+
+    # 加载黑名单
+    blacklist = set()
+    try:
+        with open(os.path.join(os.path.dirname(__file__), 'blacklist.json')) as f:
+            bl = json.load(f)
+            blacklist.update(bl.get('permanent_delist', []))
+            blacklist.update(bl.get('coins', []))
+    except:
+        pass
+
+    # 获取可交易币种
+    _rate_limit()
+    try:
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo', timeout=15)
+        exchange_info = r.json()
+        if not isinstance(exchange_info, dict) or 'symbols' not in exchange_info:
+            raise Exception("fapi exchangeInfo invalid")
+    except Exception:
+        try:
+            r = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/exchangeInfo", endpoint='um/exchangeInfo', timeout=15)
+            exchange_info = r.json()
+        except Exception:
+            print(f"❌ exchangeInfo 获取失败")
+            return []
+    tradeable_symbols = set()
+    for s in exchange_info.get('symbols', []):
+        if s.get('status') == 'TRADING' and s.get('quoteAsset') == 'USDT':
+            sym = s['symbol']
+            for f in s.get('filters', []):
+                if f.get('filterType') == 'MIN_NOTIONAL':
+                    min_notional = float(f.get('minNotional', 0))
+                    if min_notional < 50:
+                        tradeable_symbols.add(sym)
+                        break
+    print(f"可交易币种: {len(tradeable_symbols)}")
+
+    # 获取全部24h行情(不按涨跌幅排序,拿全市场)
+    _rate_limit()
+    try:
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr", endpoint='ticker/24hr', params={"limit": 200}, timeout=15)
+        all_tickers = r.json()
+        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+            raise Exception("rate limited")
+    except Exception:
+        try:
+            r = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr", endpoint='um/ticker/24hr', params={"limit": 200}, timeout=15)
+            all_tickers = r.json()
+        except Exception:
+            print(f"❌ ticker/24hr 获取失败")
+            return []
+
+    # === 第一轮: 基于24h行情粗筛 ===
+    candidates = []
+    for ticker in all_tickers:
+        if not isinstance(ticker, dict):
+            continue
+        sym = ticker.get('symbol', '')
+        if not sym.endswith('USDT'):
+            continue
+        if sym in blacklist:
+            continue
+        if sym not in tradeable_symbols:
+            continue
+
+        try:
+            price = float(ticker.get('lastPrice', 0))
+            high = float(ticker.get('highPrice', 0))
+            low = float(ticker.get('lowPrice', 0))
+            change = float(ticker.get('priceChangePercent', 0))
+            volume = float(ticker.get('quoteVolume', 0))
+        except (ValueError, TypeError):
+            continue
+        if price == 0 or low == 0:
+            continue
+        if volume < min_vol_24h:
+            continue
+        vol_pct = (high - low) / price * 100
+        if vol_pct < min_volatility or vol_pct > max_volatility:
+            continue
+
+        candidates.append({
+            'symbol': sym,
+            'price': price,
+            'change_24h': round(change, 2),
+            'volume_24h': volume,
+            'vol_24h_pct': round(vol_pct, 2),
+            'high_24h': high,
+            'low_24h': low,
+        })
+
+    # 按 成交额×波动率 取前30名进入第二轮
+    candidates.sort(key=lambda x: x['volume_24h'] * x['vol_24h_pct'], reverse=True)
+    round1_top = min(round1_count, len(candidates))
+    round1_coins = candidates[:round1_top]
+    print(f"第一轮: {len(candidates)} 通过粗筛 | 取前{round1_top}名\n")
+
+    # === 第二轮: 直接拉1h+30m K线(按第一轮排序输出,不额外筛选) ===
+    final_coins = round1_coins[:top_n]
+
+    def _fetch_klines(c):
+        sym = c['symbol']
+        try:
+            klines_1h  = _get_klines_raw(sym, '1h', 12)
+            klines_30m = _get_klines_raw(sym, '30m', 8)
+            return sym, {'klines_1h': klines_1h, 'klines_30m': klines_30m}
+        except Exception:
+            return sym, {}
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_fetch_klines, c): c for c in final_coins}
+        for future in as_completed(futures):
+            sym, kls = future.result()
+            for c in final_coins:
+                if c['symbol'] == sym:
+                    c.update(kls)
+                    break
+
+    print(f"输出K线 ({len(final_coins)}个币种)...\n")
+
+    # 输出: 复用 llm_analyze_batch 的紧凑格式
+    llm_analyze_batch(final_coins)
+
+    return final_coins
+
+def scan_score_top(top_n: int = 30,
+                   min_vol_24h: float = 3000000,
+                   min_volatility: float = 1.5,
+                   max_volatility: float = 30.0) -> List[Dict]:
+    """
+    scan-score: 全市场趋势评分
+
+    第一步: 全市场 ticker/24hr 过滤成交额+波动率
+    第二步: 并发拉所有候选币的 1h+30m K线
+    第三步: 程序计算趋势分(方向+位置+量能)
+    第四步: 按分排序,输出摘要+top N K线
+
+    输出: 所有币的评分摘要 + top N 的 K 线(供 LLM 分析)
+    """
+    print(f"\n{'='*70}")
+    print(f"SCAN-SCORE - 全市场趋势评分 (top={top_n})")
+    print(f"{'='*70}")
+
+    blacklist = set()
+    try:
+        with open(os.path.join(os.path.dirname(__file__), 'blacklist.json')) as f:
+            bl = json.load(f)
+            blacklist.update(bl.get('permanent_delist', []))
+            blacklist.update(bl.get('coins', []))
+    except:
+        pass
+
+    _rate_limit()
+    try:
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/exchangeInfo", endpoint='exchangeInfo', timeout=15)
+        exchange_info = r.json()
+    except Exception:
+        try:
+            r = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/exchangeInfo", endpoint='um/exchangeInfo', timeout=15)
+            exchange_info = r.json()
+        except Exception:
+            print("❌ exchangeInfo 获取失败")
+            return []
+
+    tradeable = set()
+    for s in exchange_info.get('symbols', []):
+        if s.get('status') == 'TRADING' and s.get('quoteAsset') == 'USDT':
+            for f in s.get('filters', []):
+                if f.get('filterType') == 'MIN_NOTIONAL':
+                    if float(f.get('minNotional', 0)) < 50:
+                        tradeable.add(s['symbol'])
+                        break
+
+    _rate_limit()
+    try:
+        r = _rl_request('GET', f"{FAPI_URL}/fapi/v1/ticker/24hr",
+                        endpoint='ticker/24hr', params={"limit": 200}, timeout=15)
+        all_tickers = r.json()
+        if isinstance(all_tickers, dict) and all_tickers.get('code') == -1003:
+            raise Exception("rate limited")
+    except Exception:
+        try:
+            r = _rl_request('GET', f"{PAPI_URL}/papi/v1/um/ticker/24hr",
+                            endpoint='um/ticker/24hr', params={"limit": 200}, timeout=15)
+            all_tickers = r.json()
+        except Exception:
+            print("❌ ticker/24hr 获取失败")
+            return []
+
+    candidates = []
+    for t in all_tickers:
+        if not isinstance(t, dict):
+            continue
+        sym = t.get('symbol', '')
+        if not sym.endswith('USDT') or sym in blacklist or sym not in tradeable:
+            continue
+        try:
+            price  = float(t.get('lastPrice', 0))
+            high   = float(t.get('highPrice', 0))
+            low    = float(t.get('lowPrice', 0))
+            change = float(t.get('priceChangePercent', 0))
+            volume = float(t.get('quoteVolume', 0))
+        except (ValueError, TypeError):
+            continue
+        if price == 0 or low == 0:
+            continue
+        if volume < min_vol_24h:
+            continue
+        vol_pct = (high - low) / price * 100
+        if vol_pct < min_volatility or vol_pct > max_volatility:
+            continue
+
+        candidates.append({
+            'symbol':     sym,
+            'price':      price,
+            'change_24h': round(change, 2),
+            'volume_24h': volume,
+            'vol_24h_pct': round(vol_pct, 2),
+        })
+
+    total_candidates = len(candidates)
+    print(f"通过粗筛: {total_candidates} 个币种")
+
+    scored = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_calc_trend_score, c['symbol']): c for c in candidates}
+        for i, future in enumerate(as_completed(futures)):
+            c = futures[future]
+            result = future.result()
+            if result is not None:
+                result.update({
+                    'price':        c['price'],
+                    'change_24h':   c['change_24h'],
+                    'volume_24h':   c['volume_24h'],
+                    'vol_24h_pct':  c['vol_24h_pct'],
+                })
+                scored.append(result)
+            if (i + 1) % 50 == 0:
+                print(f"  已评分: {i+1}/{total_candidates} ...")
+
+    if not scored:
+        print("❌ 没有币种通过评分")
+        return []
+
+    scored.sort(key=lambda x: x['score'], reverse=True)
+
+    print(f"\n{'='*70}")
+    print(f"评分摘要 (共 {len(scored)} 个币)")
+    print(f"{'='*70}")
+    print(f"{'排名':>4}  {'币种':<16} {'综合分':>6} {'趋势':>5} {'位置':>6} {'量比':>6}  {'建议'}")
+    print("-" * 70)
+
+    for i, s in enumerate(scored):
+        trend_sym = "+2" if s['trend'] == 2 else "-2" if s['trend'] == -2 else \
+                    "+1" if s['trend'] == 1 else "-1" if s['trend'] == -1 else " 0"
+        pos_bar = f"{s['position']:>5.1f}%"
+        vol_bar = f"{s['vol_ratio']:>5.2f}x"
+        score_str = f"{'+' if s['score'] > 0 else ''}{s['score']}"
+        print(f"{i+1:>4}  {s['symbol']:<16} {score_str:>6} {trend_sym:>5} {pos_bar} {vol_bar}  {s['trend_label']}")
+
+    print(f"\n趋势分说明: 综合分 = 趋势(+-2) + 位置(+-1) + 量能(+-1)")
+
+    final_coins = scored[:top_n]
+    print(f"\n{'='*70}")
+    print(f"输出K线 (前{len(final_coins)}名按趋势分排序)")
+    print(f"{'='*70}\n")
+
+    llm_analyze_batch(final_coins)
+    return scored
+
+
+def _calc_trend_score(symbol: str):
+    """计算单个币的趋势评分（纯程序化，无指标）"""
+    try:
+        klines_1h  = _get_klines_raw(symbol, '1h',  12)
+        klines_30m = _get_klines_raw(symbol, '30m', 8)
+    except Exception:
+        return None
+
+    if len(klines_1h) < 6 or len(klines_30m) < 3:
+        return None
+
+    closes_1h  = [float(k[4]) for k in klines_1h]
+    highs_1h   = [float(k[2]) for k in klines_1h]
+    lows_1h    = [float(k[3]) for k in klines_1h]
+
+    current_price = closes_1h[-1]
+    period_high   = max(highs_1h)
+    period_low    = min(lows_1h)
+    position_pct  = (current_price - period_low) / (period_high - period_low) * 100 \
+                    if period_high != period_low else 50.0
+
+    recent_highs = highs_1h[-2:]
+    older_highs  = highs_1h[-4:-2]
+    recent_lows  = lows_1h[-2:]
+    older_lows   = lows_1h[-4:-2]
+
+    h_up   = max(recent_highs)  > max(older_highs)
+    h_down = max(recent_highs)  < max(older_highs)
+    l_up   = min(recent_lows)   > min(older_lows)
+    l_down = min(recent_lows)   < min(older_lows)
+
+    trend_score = +2 if (h_up and l_up) else -2 if (h_down and l_down) else \
+                  +1 if (h_up or l_up)  else -1 if (h_down or l_down) else 0
+
+    position_score = +1 if position_pct < 25 else -1 if position_pct > 75 else 0
+
+    volumes_30m = [float(k[5]) for k in klines_30m]
+    if len(volumes_30m) >= 4:
+        avg_vol  = sum(volumes_30m[-4:-1]) / 3
+        vol_ratio = volumes_30m[-1] / avg_vol if avg_vol > 0 else 1.0
+        vol_score = +1 if vol_ratio > 1.5 else -1 if vol_ratio < 0.6 else 0
+    else:
+        vol_ratio = 1.0
+        vol_score = 0
+
+    total_score = trend_score + position_score + vol_score
+
+    trend_labels = {
+        (True, False, False, False): "↑ 偏强",
+        (False, True, False, False): "↓ 偏弱",
+        (False, False, True, False): "↑ 偏强",
+        (False, False, False, True): "↓ 偏弱",
+    }
+
+    if total_score >= 3:
+        trend_label = "↑↑ LONG候选 ✅"
+    elif total_score >= 1:
+        trend_label = "↑ 偏强"
+    elif total_score <= -3:
+        trend_label = "↓↓ SHORT候选 ✅"
+    elif total_score <= -1:
+        trend_label = "↓ 偏弱"
+    else:
+        trend_label = "→ 观望"
+
+    return {
+        'symbol':      symbol,
+        'score':       total_score,
+        'trend':       trend_score,
+        'position':    round(position_pct, 1),
+        'vol_ratio':   round(vol_ratio, 2),
+        'vol_score':   vol_score,
+        'trend_label': trend_label,
+        'klines_1h':   klines_1h,
+        'klines_30m':  klines_30m,
+    }
+
 
 def get_market_data(symbol: str, kline_count: int = 15) -> Dict:
     """获取市场数据(优化:减少API调用,只取30m+1h两周期)"""
@@ -2300,9 +2661,19 @@ def get_status(symbol: str = None) -> Dict:
 
 def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     """开空仓"""
-    trader = BinanceTrader()
+    # ===== Bug P3 Fix: 开仓前强制检查黑名单 =====
+    blacklist = set()
+    try:
+        with open(os.path.join(os.path.dirname(__file__), 'blacklist.json')) as f:
+            bl = json.load(f)
+            blacklist.update(bl.get('permanent_delist', []))
+            blacklist.update(bl.get('coins', []))
+    except Exception:
+        pass
+    if symbol in blacklist:
+        raise Exception(f"[{symbol}] 在黑名单中，禁止开仓")
 
-    # 获取当前价格
+    trader = BinanceTrader()
     price = trader.get_price(symbol)
 
     # 获取数量精度
@@ -2319,14 +2690,20 @@ def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     except Exception:
         pass
 
-    # 计算开仓数量(round 到 stepSize 的整数倍)
+    # ===== Bug P2 Fix: 开仓前检查最小名义价值 =====
+    # 计算名义价值
     quantity = (margin * leverage) / price
     if step_size and step_size > 0:
         quantity = round(round(quantity / step_size) * step_size, 8)
     else:
-        quantity = round(quantity, 8)  # 无法获取step_size时,保留8位小数
+        quantity = round(quantity, 8)
     if quantity <= 0:
         quantity = 0.00000001
+
+    notional = quantity * price
+    # Binance 最小名义价值 5 USDT, 低于此值直接拒绝
+    if notional < 5:
+        raise Exception(f"[{symbol}] 名义价值 ${notional:.2f} < 5 USDT (最小成交额限制)，无法开仓")
 
     print(f"\n{'='*60}")
     print(f"🔴 开空仓: {symbol}")
@@ -2335,20 +2712,30 @@ def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     print(f"杠杆: {leverage}x")
     print(f"价格: ${price:.4f}")
     print(f"数量: {quantity}")
+    print(f"名义价值: ${notional:.2f}")
     print()
+
+    # ===== Bug P1 Fix: PM 账户跳过杠杆设置 =====
+    if is_portfolio_margin():
+        try:
+            trader.set_leverage(symbol, leverage)
+        except Exception as e:
+            print(f"[WARN] 设置杠杆失败(继续开仓): {e}", file=sys.stderr)
 
     result = trader.open_short(symbol, quantity, leverage)
     print(f"订单结果: {json.dumps(result, indent=2)}")
-    # 判断是否成功
-    if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
+    # Bug P1 Fix: 以 status 为准判断是否成功
+    order_status = result.get('status', '')
+    is_success = order_status in ('NEW', 'FILLED', 'PARTIALLY_FILLED') or result.get('orderId') or result.get('clientOrderId')
+    if is_success:
         print(f"\n✅ 开空仓成功")
         # ===== 自动设置止损(杠杆前1%,止盈由LLM设置)=====
         import math
         qty_int = max(1, math.ceil(quantity))
-        sl_trigger = round(price * 1.02, 6)   # 止损: 涨2%触发(市价平)
+        sl_trigger = round(price * 1.03, 6)   # 止损: 涨3%触发(市价平)
         try:
             trader.set_stop_loss(symbol, 'BUY', qty_int, sl_trigger)
-            print(f"  ✅ 止损 @ ${sl_trigger} (涨1%触发,杠杆前1%止损")
+            print(f"  ✅ 止损 @ ${sl_trigger} (涨3%触发)")
         except Exception as e:
             print(f"  ⚠️ 止损设置失败: {e}")
         print(f"  i️ 止盈由LLM分析后设置")
@@ -2390,7 +2777,19 @@ def do_close_short(symbol: str, percent: float = 100) -> Dict:
         return result
 
 def do_open_long(symbol: str, margin: float, leverage: int) -> Dict:
-    """开多仓"""
+    """\xe5\xbc\x80\xe5\xa4\x9a\xe4\xbb\x93"""
+    # ===== Bug P3 Fix: \xe5\xbc\x80\xe4\xbb\x93\xe5\x89\x8d\xe5\xbc\xba\xe5\x88\xb6\xe6\xa3\x80\xe6\x9f\xa5\xe9\xbb\x91\xe5\x90\x8d\xe5\x8d\x95 =====
+    blacklist = set()
+    try:
+        with open(os.path.join(os.path.dirname(__file__), 'blacklist.json')) as f:
+            bl = json.load(f)
+            blacklist.update(bl.get('permanent_delist', []))
+            blacklist.update(bl.get('coins', []))
+    except Exception:
+        pass
+    if symbol in blacklist:
+        raise Exception(f"[{symbol}] \xe5\x9c\xa8\xe9\xbb\x91\xe5\x90\x8d\xe5\x8d\x95\xe4\xb8\xad\xe7\xa6\x81\xe6\xad\xa2\xe5\xbc\x80\xe4\xbb\x93")
+
     trader = BinanceTrader()
     price = trader.get_price(symbol)
 
@@ -2415,32 +2814,46 @@ def do_open_long(symbol: str, margin: float, leverage: int) -> Dict:
     if quantity <= 0:
         quantity = 0.00000001
 
+    # ===== Bug P2 Fix: \xe5\xbc\x80\xe4\xbb\x93\xe5\x89\x8d\xe6\xa3\x80\xe6\x9f\xa5\xe6\x9c\x80\xe5\xb0\x8f\xe5\x90\x8d\xe4\xb9\x89\xe4\xbb\xa3\xe4\xbb\xa7 =====
+    notional = quantity * price
+    if notional < 5:
+        raise Exception(f"[{symbol}] \xe5\x90\x8d\xe4\xb9\x89\xe4\xbb\xa3\xe5\x80\xbc ${notional:.2f} < 5 USDT (\xe6\x9c\x80\xe5\xb0\x8f\xe6\x88\x90\xe4\xba\xa4\xe9\xa2\x9d\xe9\x99\x90\xe5\x88\xb6)\uff0c\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe4\xbb\x93")
+
     print(f"\n{'='*60}")
-    print(f"🟢 开多仓: {symbol}")
+    print(f"\xf0\x9f\x9f\xa2 \xe5\xbc\x80\xe5\xa4\x9a\xe4\xbb\x93: {symbol}")
     print(f"{'='*60}")
-    print(f"保证金: ${margin}")
-    print(f"杠杆: {leverage}x")
-    print(f"价格: ${price:.4f}")
-    print(f"数量: {quantity}")
+    print(f"\xe4\xbf\x9d\xe8\xaf\x81\xe9\x87\x91: ${margin}")
+    print(f"\xe6\x9d\x83\xe6\x9d\x83: {leverage}x")
+    print(f"\xe4\xbb\xb7\xe6\xa0\xbc: ${price:.4f}")
+    print(f"\xe6\x95\xb0\xe9\x87\x8f: {quantity}")
+    print(f"\xe5\x90\x8d\xe4\xb9\x89\xe4\xbb\xa3\xe5\x80\xbc: ${notional:.2f}")
     print()
 
+    # ===== Bug P4 Fix: PM \xe8\xb4\xa6\xe6\x88\xb7\xe8\xb7\xb3\xe8\xbf\x87\xe6\x9d\x83\xe6\x9d\x83\xe8\xae\xbe\xe7\xbd\xae =====
+    if is_portfolio_margin():
+        try:
+            trader.set_leverage(symbol, leverage)
+        except Exception as e:
+            print(f"[WARN] \xe8\xae\xbe\xe7\xbd\xae\xe6\x9d\x83\xe6\x9d\x83\xe5\xa4\xb1\xe8\xb5\xa5(\xe7\xbb\xa7\xe7\xbb\xad\xe5\xbc\x80\xe4\xbb\x93): {e}", file=sys.stderr)
     result = trader.open_long(symbol, quantity, leverage)
-    print(f"订单结果: {json.dumps(result, indent=2)}")
-    # 判断是否成功
-    if result.get('orderId') or result.get('clientOrderId') or result.get('symbol'):
-        print(f"\n✅ 开多仓成功")
-        # ===== 自动设置止损(杠杆前1%,止盈由LLM设置)=====
+    print(f"\xe8\xae\xa2\xe5\x8d\x95\xe7\xbb\x93\xe6\x9e\x9c: {json.dumps(result, indent=2)}")
+    # Bug P1 Fix: \xe4\xbb\xa5 status \xe4\xb8\xba\xe5\x87\x86\xe5\x88\xa4\xe6\x96\xad\xe6\x98\xaf\xe5\x90\xa6\xe6\x88\x90\xe5\x8a\x9f
+    order_status = result.get('status', '')
+    is_success = order_status in ('NEW', 'FILLED', 'PARTIALLY_FILLED') or result.get('orderId') or result.get('clientOrderId')
+    if is_success:
+        print(f"\n\xe2\x9c\x85 \xe5\xbc\x80\xe5\xa4\x9a\xe4\xbb\x93\xe6\x88\x90\xe5\x8a\x9f")
+        # ===== \xe8\x87\xaa\xe5\x8a\xa8\xe8\xae\xbe\xe7\xbd\xae\xe6\xad\xa2\xe6\x8d\x9f(\xe6\x9d\x83\xe6\x9d\x83\xe5\x89\x8d1%, \xe6\xad\xa2\xe7\x9b\x88\xe7\x94\xb1LLM\xe8\xae\xbe\xe7\xbd\xae)=====
         import math
         qty_int = max(1, math.ceil(quantity))
-        sl_trigger = round(price * 0.98, 6)   # 止损: 跌2%触发(市价平)
+        sl_trigger = round(price * 0.97, 6)
         try:
             trader.set_stop_loss(symbol, 'SELL', qty_int, sl_trigger)
-            print(f"  ✅ 止损 @ ${sl_trigger} (跌1%触发,杠杆前1%止损")
+            print(f"  \xe2\x9c\x85 \xe6\xad\xa2\xe6\x8d\x9f @ ${sl_trigger} (\xe8\xb7\x8c3%\xe8\xa7\xa6\xe5\x8f\x91)")
         except Exception as e:
-            print(f"  ⚠️ 止损设置失败: {e}")
-        print(f"  i️ 止盈由LLM分析后设置")
+            print(f"  \xe2\x9a\xa0\xef\xb8\x8f \xe6\xad\xa2\xe6\x8d\x9f\xe8\xae\xbe\xe7\xbd\xae\xe5\xa4\xb1\xe8\xb4\xa5: {e}")
+        print(f"  i\xef\xb8\x8f \xe6\xad\xa2\xe7\x9b\x88\xe7\x94\xb1LLM\xe5\x88\x86\xe6\x9e\x90\xe5\x90\x8e\xe8\xae\xbe\xe7\xbd\xae")
     else:
-        print(f"\n❌ 开多仓失败: {result}")
+        print(f"\n\xe2\x9d\x8c \xe5\xbc\x80\xe5\xa4\x9a\xe4\xbb\x93\xe5\xa4\xb1\xe8\xb4\xa5: {result}")
     return result
 
 def do_close_long(symbol: str, percent: float = 100) -> Dict:
@@ -2500,10 +2913,24 @@ def main():
 
     # scan-all(统一波动率扫描,多空一起)
     scan_all_parser = subparsers.add_parser('scan-all', help='统一波动率扫描(多空一起)')
-    scan_all_parser.add_argument('--top', type=int, default=20, help='取前N个高波动币种')
-    scan_all_parser.add_argument('--min-vol', type=float, default=3.0, help='最低1h波动率%')
-    scan_all_parser.add_argument('--klines', type=int, default=30, help='给多少个候选拿K线')
+    scan_all_parser.add_argument('--top', type=int, default=50, help='最终输出币种个数(默认50)')
+    scan_all_parser.add_argument('--klines', type=int, default=50, help='给多少个候选拿K线(默认50)')
+    scan_all_parser.add_argument('--min-vol', type=float, default=3.0, help='最低1h波动率%%')
     scan_all_parser.add_argument('--log', type=str, default=None, help='日志文件(覆盖模式,默认stdout)')
+
+    # scan-pick(量价筛选,适合0策略)
+    scan_pick_parser = subparsers.add_parser('scan-pick', help='量价筛选(两轮:24h粗筛→1h K线量比重排)')
+    scan_pick_parser.add_argument('--top', type=int, default=30, help='输出币种个数(默认30)')
+    scan_pick_parser.add_argument('--round1-count', type=int, default=30, help='第一轮粗筛取前N名(默认30)')
+    scan_pick_parser.add_argument('--min-vol-24h', type=float, default=3000000, help='最低24h成交额USDT(默认300万)')
+    scan_pick_parser.add_argument('--min-volatility', type=float, default=1.5, help='最低24h波动率(默认1.5%%)')
+    scan_pick_parser.add_argument('--max-volatility', type=float, default=30.0, help='最高24h波动率(默认30.0%%)')
+
+    scan_score_parser = subparsers.add_parser('scan-score', help='全市场趋势评分(程序初选→LLM分析)')
+    scan_score_parser.add_argument('--top', type=int, default=30, help='输出K线个数(默认30)')
+    scan_score_parser.add_argument('--min-vol-24h', type=float, default=3000000, help='最低24h成交额USDT(默认300万)')
+    scan_score_parser.add_argument('--min-volatility', type=float, default=1.5, help='最低24h波动率(默认1.5%%)')
+    scan_score_parser.add_argument('--max-volatility', type=float, default=30.0, help='最高24h波动率(默认30.0%%)')
 
     # market
     market_parser = subparsers.add_parser('market', help='市场数据')
@@ -2593,6 +3020,12 @@ def main():
             _log_fd.close()
             os.close(_orig_out)
             os.close(_orig_err)
+
+    elif args.command == 'scan-pick':
+        scan_pick_top(args.top, args.min_vol_24h, args.min_volatility, args.max_volatility, args.round1_count)
+
+    elif args.command == 'scan-score':
+        scan_score_top(args.top, args.min_vol_24h, args.min_volatility, args.max_volatility)
 
     elif args.command == 'market':
         if not args.symbol:
