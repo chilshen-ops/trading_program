@@ -1,3 +1,16 @@
+# ========== v10 核心原则 (2026-05-20) ==========
+# 1. 严禁使用指标 (RSI/MACD/布林带/MA) — 指标是滞后的谎言
+# 2. 只看价格行为: K线力度、成交量、关键位置博弈
+# 3. 仓位: 单笔保证金 <= 20% 余额，波动大时 <= 10%
+# 4. 止损: 入场价 ±2% (固定) 或 ±1.5倍ATR (波动调整)
+# 5. 止盈: 止损幅度的 1.5倍 (R:R = 1:1.5)
+# 6. 每笔交易前强制检查黑名单
+# 7. 交易日志记录到 journal.json
+# 8. Cooldown: 连亏2笔强制休息1小时
+# 9. 保本止损: 浮盈>=1%移止损到成本价
+# ========== v10 END ==========
+
+
 import os
 import sys
 import time
@@ -52,16 +65,80 @@ SIMULATE = os.environ.get('SIMULATE', 'false').lower() == 'true'
 
 SIM_STATE_FILE = os.path.join(os.path.dirname(__file__), '.sim_state.json')
 _CONDITIONAL_ORDERS_FILE = os.path.join(os.path.dirname(__file__), '.conditional_orders.json')
+_JOURNAL_FILE = os.path.join(os.path.dirname(__file__), 'journal.json')
 
 # Module-level simulation state
 _sim_balance = 1000.0
-_sim_positions = {}
+# positions 结构: {symbol: [{qty, entry_price, leverage, margin, side}, ...]}
+# 同一币种可能有多层持仓（多空分开存），用 list 管理
+_sim_positions: Dict[str, List[Dict]] = {}
+
+# ========== v10 交易日志 ==========
+def _load_journal() -> List[Dict]:
+    if os.path.exists(_JOURNAL_FILE):
+        try:
+            with open(_JOURNAL_FILE) as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except:
+            pass
+    return []
+
+def _save_trade(trade: Dict):
+    """追加单笔交易到 journal.json"""
+    journal = _load_journal()
+    journal.append({**trade, 'ts': datetime.now().isoformat()})
+    try:
+        with open(_JOURNAL_FILE, 'w') as f:
+            json.dump(journal, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[JOURNAL] ❌ 保存失败({_JOURNAL_FILE}): {e}", file=sys.stderr)
+
+
+def _verify_sim_state(balance: float, positions: Dict) -> bool:
+    """验证 sim_state 与 journal 重构值的一致性（诊断用）"""
+    journal = _load_journal()
+    calc_balance = 1000.0
+    calc_positions = {}  # symbol -> list of margin infos
+    for t in journal:
+        action = t['action']
+        symbol = t['symbol']
+        margin = t.get('margin', 0)
+        qty = t.get('qty', 0)
+        entry = t.get('entry', 0)
+        pnl = t.get('pnl', 0)
+        side = t.get('side', 'LONG')
+        if action == 'OPEN':
+            fee = qty * entry * 0.001
+            calc_balance -= (margin + fee)
+            if symbol not in calc_positions:
+                calc_positions[symbol] = []
+            calc_positions[symbol].append({'margin': margin, 'qty': qty, 'entry': entry, 'side': side})
+        elif action == 'CLOSE':
+            calc_balance += pnl
+            if symbol in calc_positions and calc_positions[symbol]:
+                calc_positions[symbol].pop()
+    
+    open_symbols = {s for s, stacks in calc_positions.items() if stacks}
+    sim_symbols = set(positions.keys())
+    balance_match = abs(calc_balance - balance) < 0.01
+    positions_match = open_symbols == sim_symbols
+    
+    if not balance_match or not positions_match:
+        print(f"[SIM STATE] ⚠️ 状态不一致!")
+        print(f"  journal重构 balance={calc_balance:.4f} | .sim_state balance={balance:.4f}")
+        print(f"  journal未平仓={open_symbols} | .sim_state持仓={sim_symbols}")
+        return False
+    print(f"[SIM STATE] ✅ 状态一致 (balance={balance:.4f}, positions={list(sim_symbols)})")
+    return True
+
+
 
 def _load_sim_state():
     """从文件加载模拟状态
 
     Returns:
-        tuple: (balance, positions) - 总是返回 tuple,加载失败时返回默认值
+        tuple: (balance, positions) - 总是返回 tuple,加载失败时记录错误而非静默返回默认
     """
     if os.path.exists(SIM_STATE_FILE):
         try:
@@ -69,22 +146,47 @@ def _load_sim_state():
                 state = json.load(f)
             global _sim_balance, _sim_positions
             _sim_balance = state.get('balance', 1000.0)
-            _sim_positions = state.get('positions', {})
+            # 兼容旧格式: positions 可能还是 {symbol: {...}} 需要转成 {symbol: [...]}
+            raw_positions = state.get('positions', {})
+            converted = {}
+            for sym, val in raw_positions.items():
+                if isinstance(val, list):
+                    converted[sym] = val
+                elif isinstance(val, dict):
+                    # 旧格式单个持仓，转成 list
+                    converted[sym] = [val]
+            _sim_positions = converted
             return (_sim_balance, _sim_positions)
-        except Exception:
-            pass  # 文件损坏时仍返回默认值,保持一致性
+        except json.JSONDecodeError as e:
+            print(f"[SIM STATE] ❌ JSON解析失败({SIM_STATE_FILE}): {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[SIM STATE] ❌ 加载失败({SIM_STATE_FILE}): {e}", file=sys.stderr)
     return (1000.0, {})
 
 def _save_sim_state(balance, positions):
-    """保存模拟状态到文件"""
+    """保存模拟状态到文件（原子写入 + 写后验证，防止并发覆盖和数据丢失）"""
     global _sim_balance, _sim_positions
     _sim_balance = balance
     _sim_positions = positions
+    tmp_file = SIM_STATE_FILE + '.tmp'
     try:
-        with open(SIM_STATE_FILE, 'w') as f:
+        with open(tmp_file, 'w') as f:
             json.dump({'balance': balance, 'positions': positions}, f)
-    except:
-        pass
+        # Bug 1 Fix: 写完后验证内容是否正确写入，防止部分写入导致数据丢失
+        with open(tmp_file, 'r') as f:
+            verified = json.load(f)
+        if abs(verified['balance'] - balance) > 1e-9 or verified['positions'] != positions:
+            raise Exception("验证失败: 写入内容与内存不一致")
+        os.replace(tmp_file, SIM_STATE_FILE)
+    except Exception as e:
+        print(f"[SIM STATE] ❌ 保存失败({SIM_STATE_FILE}): {e}", file=sys.stderr)
+        # 尝试回退: 写一个带有时间戳的错误标记，便于排查
+        try:
+            err_file = SIM_STATE_FILE + f'.save_err_{int(time.time())}'
+            with open(err_file, 'w') as f:
+                json.dump({'balance': balance, 'positions': positions, 'save_error': str(e)}, f)
+        except:
+            pass
 
 
 def _load_conditional_orders() -> Dict:
@@ -346,9 +448,12 @@ class BinanceTrader:
         })
 
     def get_conditional_orders(self, symbol: str = None) -> List[Dict]:
-        """查询PM账户活跃条件单(PM账户不支持此接口,始终返回空列表)"""
-        # PM账户 /papi/v1/um/conditional/openOrders 返回 404,无法查询
-        # 使用 .conditional_orders.json 文件追踪活跃条件单
+        """查询PM账户活跃条件单(PM账户不支持此接口,始终返回空列表)
+        
+        PM账户 /papi/v1/um/conditional/openOrders 返回 404,无法通过API查询活跃条件单。
+        使用 .conditional_orders.json 文件追踪活跃条件单(下单时自动保存,cancel时删除)。
+        如需查询真实活跃状态,请通过 exchangeInfo 或经纪商后台确认。
+        """
         return []
 
     def replace_conditional_order(self, symbol: str, side: str, quantity: int,
@@ -544,8 +649,8 @@ class BinanceTrader:
             return {
                 'totalAvailableBalance': str(_sim_balance),
                 'balances': [{'asset': 'USDT', 'free': str(_sim_balance)}],
-                'positions': [{'symbol': s, 'positionAmt': str(-v['qty']), 'entryPrice': str(v['entry_price'])}
-                              for s, v in _sim_positions.items()]
+                'positions': [{'symbol': s, 'positionAmt': str(-stacks[-1]['qty']), 'entryPrice': str(stacks[-1]['entry_price'])}
+                              for s, stacks in _sim_positions.items() if stacks]
             }
         if is_portfolio_margin():
             return _papi_get_account()
@@ -561,19 +666,36 @@ class BinanceTrader:
         if SIMULATE:
             _load_sim_state()
             result = []
-            for s, v in _sim_positions.items():
+            for s, stacks in _sim_positions.items():
                 if symbol and s != symbol:
                     continue
+                # 同一 symbol 可能有多层持仓，合并计算（后进先出只看最上层）
+                if not stacks:
+                    continue
+                pos = stacks[-1]  # 取最后一层（最新开的）
+                try:
+                    kl = requests.get(f"{self.fapi_url}/fapi/v1/klines",
+                                      params={'symbol': s, 'interval': '1m', 'limit': 1}, timeout=10, verify=certifi.where()).json()
+                    current = float(kl[0][4])
+                except Exception:
+                    current = pos['entry_price']
+                entry = pos['entry_price']
+                qty = pos['qty']
+                margin = pos.get('margin', 0)
+                lev = pos.get('leverage', 10)
+                if pos.get('side') == 'SHORT':
+                    upnl = (entry - current) / entry * lev * margin
+                else:
+                    upnl = (current - entry) / entry * lev * margin
                 result.append({
                     'symbol': s,
-                    'amount': v['qty'],  # 保留小数
-                    'entryPrice': v['entry_price'],
-                    # 模拟模式不连接交易所,unrealizedProfit 无法实时计算
-                # 如需精确浮盈,请使用 SIMULATE=true + trader.py status 获取快照
-                    'unrealizedProfit': None,
-                    'leverage': v.get('leverage', 3),
-                    'positionSide': v.get('side', 'LONG'),
-                    'margin': v.get('margin', 0)
+                    'amount': qty,
+                    'entryPrice': entry,
+                    'unrealizedProfit': round(upnl, 4),
+                    'leverage': lev,
+                    'positionSide': pos.get('side', 'LONG'),
+                    'margin': margin,
+                    'layers': len(stacks)  # 额外信息：有多少层
                 })
             return result
         if is_portfolio_margin():
@@ -623,8 +745,10 @@ class BinanceTrader:
         非 PM 账户:使用标准现货 account → free balance
         """
         if SIMULATE:
+            # Bug 8 Fix: 每次调用都重新从磁盘加载，确保获取最新余额
+            # （不同进程/命令调用时，内存状态可能已过期）
             _load_sim_state()
-            return _sim_balance
+            return _sim_balance  # 直接返回内存值，不触发磁盘加载
         if is_portfolio_margin():
             try:
                 import urllib3
@@ -659,9 +783,10 @@ class BinanceTrader:
         if SIMULATE and not _sim_positions:
             _load_sim_state()
         if SIMULATE:
-            if symbol not in _sim_positions:
+            if symbol not in _sim_positions or not _sim_positions[symbol]:
                 raise Exception(f"[SIMULATE] 无持仓: {symbol}")
-            pos = _sim_positions[symbol]
+            # 取出最后一层持仓（后进先出）
+            pos = _sim_positions[symbol][-1]
             price = pos['entry_price']  # 用入场价
             qty = pos['qty']
             side = pos.get('side', 'LONG')
@@ -672,14 +797,18 @@ class BinanceTrader:
             except Exception:
                 pass
             if side == 'SHORT':
-                pnl = (pos['entry_price'] - price) * qty
+                pnl = (pos['entry_price'] - price) / pos['entry_price'] * pos.get('leverage', 10) * pos.get('margin', 0)
             else:
-                pnl = (price - pos['entry_price']) * qty
-            close_fee = qty * price * 0.001
+                pnl = (price - pos['entry_price']) / pos['entry_price'] * pos.get('leverage', 10) * pos.get('margin', 0)
+            close_fee = pos.get('margin', 0) * 0.001
             net_pnl = pnl - close_fee
-            _sim_balance += net_pnl
-            del _sim_positions[symbol]
+            _sim_balance += net_pnl + pos.get('margin', 0)  # 平仓返还保证金 + 盈亏
+            # pop 最后一层，不直接删除整个 symbol
+            _sim_positions[symbol].pop()
+            if not _sim_positions[symbol]:
+                del _sim_positions[symbol]  # 清理空列表
             _save_sim_state(_sim_balance, _sim_positions)
+            _save_trade({'symbol': symbol, 'side': side, 'action': 'CLOSE', 'entry': pos['entry_price'], 'exit': price, 'qty': qty, 'pnl': net_pnl, 'leverage': pos.get('leverage', 10), 'margin': pos['margin']})
             print(f"[SIMULATE] 平仓 {symbol} x{qty:.4f} @ {price}, 盈亏={net_pnl:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'SELL' if side == 'LONG' else 'BUY', 'origQty': str(qty), 'pnl': net_pnl, 'margin': pos['margin']}
         if is_portfolio_margin():
@@ -742,12 +871,17 @@ class BinanceTrader:
         if SIMULATE:
             global _sim_balance, _sim_positions
             # 获取当前价格
+            # Bug 3 Fix: 价格获取失败时拒绝开仓（不能用0.001，会导致名义价值计算错误）
+            price = None
             try:
                 klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
                                       params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
-                price = float(klines[0][4])
+                if klines and isinstance(klines, list) and len(klines) > 0:
+                    price = float(klines[0][4])
             except Exception:
-                price = 0.001
+                pass
+            if price is None or price <= 0:
+                raise Exception(f"[SIMULATE] 无法获取 {symbol} 价格，开仓失败")
             # 保证金模型: 使用80%余额作为保证金的上限
             available_margin = _sim_balance * 0.8
             # 根据可用保证金反推数量
@@ -762,9 +896,14 @@ class BinanceTrader:
                 position_value = qty * price
                 margin = position_value / leverage
             fee = position_value * 0.001  # 0.1% 开仓手续费
-            _sim_positions[symbol] = {'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'SHORT', }
+            # positions 现在是 list，同一 symbol 可以多层持仓
+            if symbol not in _sim_positions:
+                _sim_positions[symbol] = []
+            _sim_positions[symbol].append({'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'SHORT'})
             _sim_balance -= (margin + fee)  # 扣除保证金和手续费
             _save_sim_state(_sim_balance, _sim_positions)
+            # v10: 记录交易日志
+            _save_trade({'symbol': symbol, 'side': 'SHORT', 'action': 'OPEN', 'entry': price, 'qty': qty, 'margin': margin, 'leverage': leverage})
             print(f"[SIMULATE] 开空 {symbol} x{qty:.4f} @ {price}, 保证金={margin:.2f} USDT, 手续费={fee:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'SELL', 'origQty': str(qty), 'margin': margin}
         try:
@@ -809,12 +948,18 @@ class BinanceTrader:
         """开多仓(PAPI um_order,单向模式:side=BUY 开多)"""
         if SIMULATE:
             global _sim_balance, _sim_positions
+            _load_sim_state()  # 确保读取最新状态
+            # Bug 3 Fix: 价格获取失败时拒绝开仓
+            price = None
             try:
                 klines = requests.get(f"{self.fapi_url}/fapi/v1/klines",
                                       params={'symbol': symbol, 'interval': '1m', 'limit': 1}, timeout=10).json()
-                price = float(klines[0][4])
+                if klines and isinstance(klines, list) and len(klines) > 0:
+                    price = float(klines[0][4])
             except Exception:
-                price = 0.001
+                pass
+            if price is None or price <= 0:
+                raise Exception(f"[SIMULATE] 无法获取 {symbol} 价格，开仓失败")
             available_margin = _sim_balance * 0.8
             qty = max(quantity, 1)
             position_value = qty * price
@@ -826,9 +971,14 @@ class BinanceTrader:
                 position_value = qty * price
                 margin = position_value / leverage
             fee = position_value * 0.001
-            _sim_positions[symbol] = {'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'LONG', }
+            # positions 现在是 list，同一 symbol 可以多层持仓
+            if symbol not in _sim_positions:
+                _sim_positions[symbol] = []
+            _sim_positions[symbol].append({'qty': qty, 'entry_price': price, 'leverage': leverage, 'margin': margin, 'side': 'LONG'})
             _sim_balance -= (margin + fee)
             _save_sim_state(_sim_balance, _sim_positions)
+            # v10: 记录交易日志
+            _save_trade({'symbol': symbol, 'side': 'LONG', 'action': 'OPEN', 'entry': price, 'qty': qty, 'margin': margin, 'leverage': leverage})
             print(f"[SIMULATE] 开多 {symbol} x{qty:.4f} @ {price}, 保证金={margin:.2f} USDT, 手续费={fee:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'BUY', 'origQty': str(qty), 'margin': margin}
         try:
@@ -877,9 +1027,12 @@ class BinanceTrader:
         if SIMULATE:
             global _sim_balance, _sim_positions
             _load_sim_state()
-            if symbol not in _sim_positions or _sim_positions[symbol].get('side') != 'LONG':
+            if symbol not in _sim_positions or not _sim_positions[symbol]:
                 raise Exception(f"[SIMULATE] No LONG position found for {symbol}")
-            pos = _sim_positions[symbol]
+            # 找最后一层 LONG（后进先出）
+            if _sim_positions[symbol][-1]['side'] != 'LONG':
+                raise Exception(f"[SIMULATE] {symbol} top layer is not LONG")
+            pos = _sim_positions[symbol][-1]
             entry = pos['entry_price']
             margin = pos['margin']
             qty = pos['qty']
@@ -889,11 +1042,14 @@ class BinanceTrader:
                 price = float(klines[0][4])
             except Exception:
                 price = entry
-            pnl = (price - entry) * qty
-            close_fee = qty * price * 0.001
+            pnl = (price - pos['entry_price']) / pos['entry_price'] * pos.get('leverage', 10) * pos.get('margin', 0)
+            close_fee = pos.get('margin', 0) * 0.001
             net_pnl = pnl - close_fee
-            _sim_balance += net_pnl
-            del _sim_positions[symbol]
+            _sim_balance += net_pnl + pos.get('margin', 0)  # 平仓返还保证金 + 盈亏
+            # pop 最后一层，不直接删除整个 symbol
+            _sim_positions[symbol].pop()
+            if not _sim_positions[symbol]:
+                del _sim_positions[symbol]
             _save_sim_state(_sim_balance, _sim_positions)
             print(f"[SIMULATE] 平多 {symbol} x{qty:.4f} @ {price}, 盈亏={net_pnl:.4f} USDT, 余额={_sim_balance:.4f}", file=sys.stderr)
             return {'orderId': 'sim_' + str(time.time()), 'symbol': symbol, 'side': 'SELL', 'origQty': str(qty), 'pnl': net_pnl, 'margin': margin}
@@ -1820,6 +1976,255 @@ def _round_to_tick(price: float, symbol: str) -> float:
     # 兜底:用 tickSize 0.0000100 → 5位小数
     return float(f"{price:.5f}")
 
+def _get_price_decimals(symbol: str) -> int:
+    """获取交易对的价格小数位数
+
+    从 exchangeInfo 的 PRICE_FILTER 获取 tickSize，计算小数位数。
+    例如: tickSize=0.0001 → 4, tickSize=0.01 → 2
+    """
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"{FAPI_URL}/fapi/v1/exchangeInfo",
+                timeout=10,
+                verify=certifi.where()
+            )
+            if r.status_code != 200:
+                raise Exception(f"status {r.status_code}")
+            data = r.json()
+            sym_data = next((s for s in data.get('symbols', []) if s.get('symbol') == symbol), None)
+            if not sym_data:
+                raise Exception(f"symbol {symbol} not in exchangeInfo")
+            for f in sym_data.get('filters', []):
+                if f.get('filterType') == 'PRICE_FILTER':
+                    tick_str = f['tickSize']
+                    if '.' in tick_str:
+                        return len(tick_str.rstrip('0').split('.')[1])
+                    return 0
+            break
+        except Exception:
+            pass
+        try:
+            r = requests.get(
+                f"{PAPI_URL}/papi/v1/um/exchangeInfo",
+                params={'symbol': symbol},
+                timeout=10,
+                verify=certifi.where()
+            )
+            if r.status_code == 200:
+                data = r.json()
+                sym_data = next((s for s in data.get('symbols', []) if s.get('symbol') == symbol), None)
+                if sym_data:
+                    for f in sym_data.get('filters', []):
+                        if f.get('filterType') == 'PRICE_FILTER':
+                            tick_str = f['tickSize']
+                            if '.' in tick_str:
+                                return len(tick_str.rstrip('0').split('.')[1])
+                            return 0
+        except Exception:
+            pass
+        import time
+        time.sleep(0.3 * (attempt + 1))
+    # 兜底: 默认 4 位小数
+    return 4
+
+
+def _get_atr_and_volatility(symbol: str) -> Dict:
+    """获取 ATR 和波动率
+    
+    Returns:
+        {'atr': float, 'atr_percent': float, 'volatility': 'low'|'medium'|'high'}
+        - atr_percent: ATR占当前价格百分比
+        - volatility: low(<0.5%), medium(0.5%-3%), high(>3%)
+    """
+    try:
+        r = requests.get(
+            f"{FAPI_URL}/fapi/v1/klines",
+            params={'symbol': symbol, 'interval': '1h', 'limit': 60},
+            timeout=10,
+            verify=certifi.where()
+        )
+        klines = r.json()
+        if not klines or not isinstance(klines, list):
+            return {'atr': 0, 'atr_percent': 0, 'volatility': 'medium'}
+        
+        # 计算 ATR (14 周期)
+        trs = []
+        for i in range(1, min(15, len(klines))):
+            h = float(klines[-i][2])
+            l = float(klines[-i][3])
+            pc = float(klines[-i-1][4])
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            trs.append(tr)
+        atr = sum(trs) / len(trs) if trs else 0
+        
+        # 当前价格
+        current_price = float(klines[-1][4])
+        atr_percent = (atr / current_price * 100) if current_price > 0 else 0
+        
+        # 波动率分类
+        if atr_percent < 0.5:
+            volatility = 'low'
+        elif atr_percent > 3.0:
+            volatility = 'high'
+        else:
+            volatility = 'medium'
+        
+        return {'atr': atr, 'atr_percent': atr_percent, 'volatility': volatility}
+    except Exception as e:
+        print(f"  ⚠️ ATR计算失败: {e}", file=sys.stderr)
+        return {'atr': 0, 'atr_percent': 0, 'volatility': 'medium'}
+
+
+def _get_dynamic_position_size(balance: float, price: float, atr_percent: float, leverage: int = 10) -> float:
+    """根据波动率计算动态仓位
+    
+    Args:
+        balance: 账户余额
+        price: 当前价格
+        atr_percent: ATR占价格百分比
+        leverage: 杠杆倍数
+    
+    Returns:
+        margin: 建议开仓保证金 USDT
+    """
+    # 基础仓位: 20% 余额
+    base_margin = balance * 0.20
+    
+    # 根据波动率调整
+    if atr_percent < 0.5:
+        # 低波动: 可以多开一点，但不超过 20%
+        margin = base_margin
+    elif atr_percent > 3.0:
+        # 高波动: 只开 10%
+        margin = balance * 0.10
+    else:
+        # 中等波动: 15%
+        margin = balance * 0.15
+    
+    return margin
+
+
+def _calculate_stop_loss(entry_price: float, atr: float, atr_percent: float, side: str) -> Dict:
+    """计算止损和止盈价格
+    
+    Args:
+        entry_price: 入场价格
+        atr: ATR 绝对值
+        atr_percent: ATR 占价格百分比
+        side: 'LONG' 或 'SHORT'
+    
+    Returns:
+        {'sl_trigger': float, 'tp_trigger': float, 'sl_percent': float, 'tp_percent': float}
+    """
+    # v10 规则: 优先 ATR，止损 = 1.5x ATR
+    # 如果 ATR 太小(低波动币种)，用固定的 2%
+    if atr_percent > 0.3:
+        sl_pct = atr_percent * 1.5  # ATR 的 1.5 倍
+    else:
+        sl_pct = 2.0  # 固定 2%
+    
+    tp_pct = sl_pct * 1.5  # 止盈 = 止损的 1.5 倍 (R:R = 1:1.5)
+    
+    if side.upper() == 'LONG':
+        sl_trigger = entry_price * (1 - sl_pct / 100)
+        tp_trigger = entry_price * (1 + tp_pct / 100)
+    else:  # SHORT
+        sl_trigger = entry_price * (1 + sl_pct / 100)
+        tp_trigger = entry_price * (1 - tp_pct / 100)
+    
+    return {
+        'sl_trigger': sl_trigger,
+        'tp_trigger': tp_trigger,
+        'sl_percent': sl_pct,
+        'tp_percent': tp_pct
+    }
+
+
+def _check_cooldown() -> bool:
+    """检查 cooldown 状态
+    
+    Returns:
+        True: 可以交易 (不在 cooldown 中)
+        False: 在 cooldown 中，禁止交易
+    """
+    import os
+    cooldown_file = os.path.join(os.path.dirname(__file__), '.cooldown.json')
+    if not os.path.exists(cooldown_file):
+        return True
+    
+    try:
+        with open(cooldown_file) as f:
+            data = json.load(f)
+        
+        # 检查是否在 cooldown 中
+        if data.get('in_cooldown'):
+            cooldown_end = data.get('cooldown_end', 0)
+            import time
+            now = time.time()
+            if now < cooldown_end:
+                remaining = int(cooldown_end - now)
+                print(f"⏸️ Cooldown 中，剩余 {remaining//60}m {remaining%60}s", file=sys.stderr)
+                return False
+            else:
+                # cooldown 结束，移除标记
+                data['in_cooldown'] = False
+                with open(cooldown_file, 'w') as f:
+                    json.dump(data, f)
+                return True
+    except Exception:
+        pass
+    return True
+
+
+def _trigger_cooldown(reason: str = "连亏2笔"):
+    """触发 cooldown"""
+    import os, time
+    cooldown_file = os.path.join(os.path.dirname(__file__), '.cooldown.json')
+    cooldown_duration = 3600  # 1小时
+    
+    data = {
+        'in_cooldown': True,
+        'cooldown_end': time.time() + cooldown_duration,
+        'reason': reason,
+        'triggered_at': time.time()
+    }
+    with open(cooldown_file, 'w') as f:
+        json.dump(data, f)
+    print(f"⏸️ Cooldown 已触发: {reason}, 持续1小时", file=sys.stderr)
+
+
+def _check_and_update_consecutive_losses():
+    """检查并更新连亏状态，触发 cooldown"""
+    import os
+    journal_file = os.path.join(os.path.dirname(__file__), 'journal.json')
+    if not os.path.exists(journal_file):
+        return
+    
+    try:
+        with open(journal_file) as f:
+            journal = json.load(f)
+        if not journal:
+            return
+        
+        # 获取最近的交易
+        recent = journal[-10:] if len(journal) > 10 else journal
+        
+        # 统计连续亏损
+        losses = 0
+        for t in reversed(recent):
+            pnl = t.get('pnl', 0)
+            if pnl < 0:
+                losses += 1
+            else:
+                break
+        
+        # 如果连亏>=2笔，触发 cooldown
+        if losses >= 2:
+            _trigger_cooldown(f"连亏{losses}笔")
+    except Exception:
+        pass
+
 
 def _round_qty_to_step(qty: float, symbol: str) -> float:
     """将数量对齐到 stepSize 精度(避免 QTY precision 错误)"""
@@ -1853,12 +2258,110 @@ def _round_qty_to_step(qty: float, symbol: str) -> float:
     return float(f"{qty:.1f}")
 
 
-def _format_klines_for_llm(klines: List, interval: str) -> str:
-    """Format klines into LLM-readable text"""
+def _detect_price_pattern(klines: List, interval: str) -> Dict:
+    """检测K线形态: 找线->等突破->看回踩 入场信号
+
+    入场三步曲:
+    1. 找线: 识别关键支撑/压力位 (最近20根K线的高低点)
+    2. 等突破: 大阳线(实体>1.5%且放量>1.5倍均量)向上突破关键位
+    3. 看回踩: 回踩关键位，缩量，不跌破，入场做多
+
+    平仓四步曲(检测到反向信号):
+    1. 拉高: 大阳线快速拉高
+    2. 洗盘: 大阴线快速下跌
+    3. 反包: 再次拉高形成反包
+    4. 阴跌: 连续小阴线无反弹
+
+    Returns:
+        dict: {
+          'pattern': str,        # 信号类型
+          'signal': str,         # 'LONG'|'SHORT'|'CLOSE'|'WATCH'
+          'signal_emoji': str,
+          'reason': str,
+          'strength': float,     # 1.0~3.0 信号强度
+          'key_level': float,    # 关键位价格
+          'level_type': str,     # 'support'|'resistance'
+        }
+    """
+    if not klines or len(klines) < 5:
+        return {'pattern': 'EMPTY', 'signal': 'WATCH', 'signal_emoji': '⬜',
+                'reason': '数据不足', 'strength': 0, 'key_level': 0, 'level_type': 'none'}
+
+    closes = [float(k[4]) for k in klines]
+    highs  = [float(k[2]) for k in klines]
+    lows   = [float(k[3]) for k in klines]
+    vols   = [float(k[5]) for k in klines]
+
+    current = closes[-1]
+    current_vol = vols[-1]
+    avg_vol = sum(vols[-5:]) / 5 if len(vols) >= 5 else sum(vols) / max(len(vols), 1)
+    period_high  = max(highs)
+    period_low  = min(lows)
+    range_size  = period_high - period_low
+
+    def body_pct(k):
+        o,c = float(k[1]), float(k[4])
+        return abs(c - o) / o * 100 if o > 0 else 0
+    def is_bullish(k): return float(k[4]) > float(k[1])
+    def is_bearish(k): return float(k[4]) < float(k[1])
+    def vol_spike(k, avg): return float(k[5]) / avg if avg > 0 else 1.0
+
+    # ---- 平仓信号: 拉高->洗盘->反包->阴跌 ----
+    if len(klines) >= 3:
+        k_n2 = klines[-3]
+        k_n1 = klines[-2]
+        k_0  = klines[-1]
+        pull_up = body_pct(k_n2) > 1.5 and is_bullish(k_n2) and vol_spike(k_n2, avg_vol) > 1.2
+        shake  = body_pct(k_n1) > 1.5 and is_bearish(k_n1) and vol_spike(k_n1, avg_vol) > 1.2
+        rev    = body_pct(k_0) > 1.0 and is_bullish(k_0) and float(k_0[4]) > float(k_n1[1])
+        if pull_up and shake and rev:
+            return {'pattern': 'DIST_REV', 'signal': 'CLOSE', 'signal_emoji': '🚪',
+                    'reason': '拉高诱多→洗盘→反包,主力派发,离场', 'strength': 3.0,
+                    'key_level': highs[-1], 'level_type': 'resistance'}
+        if len(klines) >= 4:
+            slow_leak = (is_bearish(k_n2) and body_pct(k_n2) < 0.8 and
+                        is_bearish(k_n1) and body_pct(k_n1) < 0.8 and
+                        is_bearish(k_0)  and body_pct(k_0)  < 0.8)
+            if slow_leak and closes[-1] < closes[-3]:
+                return {'pattern': 'SLOW_LEAK', 'signal': 'CLOSE', 'signal_emoji': '🚪',
+                        'reason': '连续小阴线阴跌,主力派发,离场', 'strength': 2.5,
+                        'key_level': period_low, 'level_type': 'support'}
+
+    # ---- 入场信号: 突破->回踩->确认 ----
+    if len(klines) >= 4:
+        k_3 = klines[-4]; k_2 = klines[-3]; k_1 = klines[-2]; k_0 = klines[-1]
+        consol   = body_pct(k_3) < 1.0
+        breakout = body_pct(k_2) > 1.5 and is_bullish(k_2) and vol_spike(k_2, avg_vol) > 1.5
+        pullback = body_pct(k_1) < 1.0
+        vol_dry  = vol_spike(k_1, avg_vol) < 0.6
+        confirm  = is_bullish(k_0) and closes[-1] > closes[-3]
+        if consol and breakout and pullback and vol_dry and confirm:
+            return {'pattern': 'BREAKOUT_PULLBACK', 'signal': 'LONG', 'signal_emoji': '🟢',
+                    'reason': f'突破{body_pct(k_2):.1f}%+{vol_spike(k_2,avg_vol):.1f}x量→缩量回踩{vol_spike(k_1,avg_vol):.2f}x→确认入场',
+                    'strength': 3.0, 'key_level': highs[-3], 'level_type': 'resistance'}
+        if breakout and not (pullback and vol_dry):
+            return {'pattern': 'BREAKOUT_WAIT', 'signal': 'WATCH', 'signal_emoji': '🟡',
+                    'reason': f'刚突破{body_pct(k_2):.1f}%+{vol_spike(k_2,avg_vol):.1f}x量,等回踩确认',
+                    'strength': 2.0, 'key_level': highs[-3], 'level_type': 'resistance'}
+
+    # ---- 做空信号: 向下突破->反抽->确认 ----
+    if len(klines) >= 4:
+        k_3 = klines[-4]; k_2 = klines[-3]; k_1 = klines[-2]; k_0 = klines[-1]
+        break_down = body_pct(k_2) > 1.5 and is_bearish(k_2) and vol_spike(k_2, avg_vol) > 1.5
+        pull_up_s  = body_pct(k_1) < 1.0 and vol_spike(k_1, avg_vol) < 0.6 and float(k_1[4]) < float(k_3[1])
+        confirm_s  = is_bearish(k_0) and closes[-1] < closes[-3]
+        if break_down and pull_up_s and confirm_s:
+            return {'pattern': 'BREAKDOWN_PULLBACK', 'signal': 'SHORT', 'signal_emoji': '🔵',
+                    'reason': f'向下突破{body_pct(k_2):.1f}%+{vol_spike(k_2,avg_vol):.1f}x量→缩量反抽确认做空',
+                    'strength': 3.0, 'key_level': lows[-3], 'level_type': 'support'}
+
+    return {'pattern': 'NONE', 'signal': 'WATCH', 'signal_emoji': '⬜',
+            'reason': '无信号,等待', 'strength': 0, 'key_level': 0, 'level_type': 'none'}
 
 
+
 def _format_klines_for_llm(klines: List, interval: str) -> str:
-    """Format klines into LLM-readable text"""
+    """Format klines into LLM-readable text with strategy signal annotations"""
     lines = []
     if not klines:
         return ""
@@ -1871,14 +2374,14 @@ def _format_klines_for_llm(klines: List, interval: str) -> str:
     period_low = min(lows)
     pct_from_high = ((current - period_high) / period_high * 100) if period_high > 0 else 0
     pct_from_low = ((current - period_low) / period_low * 100) if period_low > 0 else 0
-    lines.append(f"Current: {current:.6f} | Period High: {period_high:.6f}({pct_from_high:+.1f}%) | Period Low: {period_low:.6f}({pct_from_low:+.1f}%)")
+    lines.append(f"Current: {current:.6f} | High: {period_high:.6f}({pct_from_high:+.1f}%) | Low: {period_low:.6f}({pct_from_low:+.1f}%)")
     lines.append("")
     for k in klines[-15:]:
         ts = k[0] / 1000
         dt = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
         o = float(k[1]); c = float(k[4]); h = float(k[2]); l = float(k[3]); v = float(k[5])
         chg = (c - o) / o * 100 if o > 0 else 0
-        body = "UP" if c > o else "DOWN"
+        body = "▲" if c > o else "▼"
         upper_shadow = h - max(o, c)
         lower_shadow = min(o, c) - l
         lines.append(f"  {dt} O:{o:.5f} C:{c:.5f} H:{h:.5f} L:{l:.5f} {body}{chg:+.2f}% U:{upper_shadow:.5f} L:{lower_shadow:.5f} V:{v:.0f}")
@@ -2618,10 +3121,14 @@ def print_market_data(data: Dict):
     print()
 
     # 多周期K线 - 与scan-all一致格式
+    # Bug 7 Fix: 只输出实际获取到的周期，避免空数据误导
     for interval, key in [('5m', '5m'), ('30m', '30m'), ('1h', '1h'), ('4h', '4h')]:
         kls = data['klines_data'].get(key, [])
         if kls:
             print(_format_klines_for_market(kls, interval))
+        # 空周期不打印，避免误导用户
+    if not any(data['klines_data'].get(k) for k in ('5m', '30m', '1h', '4h')):
+        print("(K线数据仅包含30m+1h，如需其他周期请使用scan-all命令)")
 
 def get_status(symbol: str = None) -> Dict:
     """获取账户状态"""
@@ -2630,15 +3137,22 @@ def get_status(symbol: str = None) -> Dict:
     balance = trader.get_usdt_balance()
     positions = trader.get_positions(symbol)
 
+    # 计算未实现盈亏合计
+    unrealized_total = sum(pos.get('unrealizedProfit', 0) for pos in positions)
+    # 总资产 = 余额 + 浮盈
+    total_assets = balance + unrealized_total
+
     result = {
         'balance': balance,
+        'total_assets': total_assets,
+        'unrealized_profit': unrealized_total,
         'positions': positions
     }
 
     print(f"\n{'='*60}")
     print(f"💰 账户状态")
     print(f"{'='*60}")
-    print(f"USDT 余额: ${balance:.2f}")
+    print(f"总资产: ${total_assets:.2f}  (余额 ${balance:.2f} + 浮盈 ${unrealized_total:.2f})")
     print()
 
     if positions:
@@ -2729,16 +3243,36 @@ def do_open_short(symbol: str, margin: float, leverage: int) -> Dict:
     is_success = order_status in ('NEW', 'FILLED', 'PARTIALLY_FILLED') or result.get('orderId') or result.get('clientOrderId')
     if is_success:
         print(f"\n✅ 开空仓成功")
-        # ===== 自动设置止损(杠杆前1%,止盈由LLM设置)=====
+        # ===== ATR 止损 (v10 规则) =====
         import math
         qty_int = max(1, math.ceil(quantity))
-        sl_trigger = round(price * 1.03, 6)   # 止损: 涨3%触发(市价平)
+        
+        # 获取 ATR
+        atr_data = _get_atr_and_volatility(symbol)
+        sl_result = _calculate_stop_loss(
+            price, 
+            atr_data['atr'], 
+            atr_data['atr_percent'], 
+            'SHORT'
+        )
+        sl_trigger = _round_to_tick(sl_result['sl_trigger'], symbol)
+        tp_trigger = _round_to_tick(sl_result['tp_trigger'], symbol)
+        
+        print(f"  📊 ATR {atr_data['atr_percent']:.2f}% → 波动率: {atr_data['volatility']}")
+        print(f"  🔒 止损 @ ${sl_trigger:.{_get_price_decimals(symbol)}f} ({sl_result['sl_percent']:.2f}%)")
+        print(f"  🎯 止盈 @ ${tp_trigger:.{_get_price_decimals(symbol)}f} ({sl_result['tp_percent']:.2f}%, R:R=1:1.5)")
+        
         try:
             trader.set_stop_loss(symbol, 'BUY', qty_int, sl_trigger)
-            print(f"  ✅ 止损 @ ${sl_trigger} (涨3%触发)")
+            print(f"  ✅ 止损单已设置")
         except Exception as e:
             print(f"  ⚠️ 止损设置失败: {e}")
-        print(f"  i️ 止盈由LLM分析后设置")
+        
+        try:
+            trader.set_take_profit(symbol, 'BUY', qty_int, tp_trigger)
+            print(f"  ✅ 止盈单已设置")
+        except Exception as e:
+            print(f"  ⚠️ 止盈设置失败: {e}")
     else:
         print(f"\n❌ 开空仓失败: {result}")
     return result
@@ -2898,6 +3432,12 @@ def main():
     status_parser = subparsers.add_parser('status', help='账户状态')
     status_parser.add_argument('--symbol', type=str, help='指定币种')
 
+    # sync-sim: 从 journal 重构修复 .sim_state
+    sync_parser = subparsers.add_parser('sync-sim', help='从journal重构状态修复.sim_state')
+
+    # verify-sim: 诊断状态一致性
+    verify_parser = subparsers.add_parser('verify-sim', help='验证.sim_state与journal一致性')
+
     # scan
     scan_parser = subparsers.add_parser('scan', help='扫描涨幅币种')
     scan_parser.add_argument('--min-change', type=float, default=10, help='最小涨幅%')
@@ -2914,7 +3454,7 @@ def main():
     # scan-all(统一波动率扫描,多空一起)
     scan_all_parser = subparsers.add_parser('scan-all', help='统一波动率扫描(多空一起)')
     scan_all_parser.add_argument('--top', type=int, default=50, help='最终输出币种个数(默认50)')
-    scan_all_parser.add_argument('--klines', type=int, default=50, help='给多少个候选拿K线(默认50)')
+    scan_all_parser.add_argument('--klines', type=int, default=None, help='取多少个候选币种拿K线(默认等于--top值)')
     scan_all_parser.add_argument('--min-vol', type=float, default=3.0, help='最低1h波动率%%')
     scan_all_parser.add_argument('--log', type=str, default=None, help='日志文件(覆盖模式,默认stdout)')
 
@@ -2968,6 +3508,19 @@ def main():
     llm_hold_parser = subparsers.add_parser('llm-hold', help='LLM分析持仓')
     llm_hold_parser.add_argument('--symbol', type=str, required=True, help='币种')
 
+    # factor-signal (因子信号)
+    factor_parser = subparsers.add_parser('factor-signal', help='因子信号扫描')
+    factor_parser.add_argument('--symbol', type=str, default='btcusdt', help='币种(默认btcusdt)')
+    factor_parser.add_argument('--seconds', type=int, default=60, help='收集秒数(默认60)')
+
+    # factor-trade (因子实盘交易)
+    trade_parser = subparsers.add_parser('factor-trade', help='因子实盘交易')
+    trade_parser.add_argument('--symbol', type=str, default='btcusdt', help='币种')
+    trade_parser.add_argument('--seconds', type=int, default=60, help='收集秒数')
+    trade_parser.add_argument('--margin', type=float, default=10, help='保证金USDT')
+    trade_parser.add_argument('--leverage', type=int, default=10, help='杠杆')
+    trade_parser.add_argument('--min-conf', type=float, default=0.6, help='最小置信度')
+
     # replace-order: 替换条件单(自动取消旧单+下新单)
     replace_parser = subparsers.add_parser('replace-order', help='替换条件单(自动取消旧单后下新单)')
     replace_parser.add_argument('--symbol', type=str, required=True, help='币种')
@@ -2990,7 +3543,52 @@ def main():
         return
 
     if args.command == 'status':
+        # ⚠️ 每次命令执行前都强制从磁盘加载最新状态
+        # 防止不同进程/命令间状态不一致
+        _load_sim_state()
         get_status(args.symbol)
+
+    elif args.command == 'sync-sim':
+        # 从 journal 重构状态，修复 .sim_state
+        print(f"\n{'='*60}")
+        print(f"🔧 SYNC-SIM: 从 journal 重构模拟状态")
+        print(f"{'='*60}")
+        journal = _load_journal()
+        calc_balance = 1000.0
+        calc_positions = {}  # symbol -> list of margin infos
+        for t in journal:
+            action = t['action']
+            symbol = t['symbol']
+            margin = t.get('margin', 0)
+            qty = t.get('qty', 0)
+            entry = t.get('entry', 0)
+            pnl = t.get('pnl', 0)
+            side = t.get('side', 'LONG')
+            leverage = t.get('leverage', 10)
+            if action == 'OPEN':
+                fee = qty * entry * 0.001
+                calc_balance -= (margin + fee)
+                if symbol not in calc_positions:
+                    calc_positions[symbol] = []
+                calc_positions[symbol].append({'margin': margin, 'qty': qty, 'entry': entry, 'side': side, 'leverage': leverage})
+            elif action == 'CLOSE':
+                calc_balance += pnl
+                if symbol in calc_positions and calc_positions[symbol]:
+                    calc_positions[symbol].pop()
+        
+        # 只保留还有持仓的币种（转为 list 结构）
+        final_positions = {}
+        for sym, stacks in calc_positions.items():
+            if stacks:
+                final_positions[sym] = stacks  # 保存完整栈（支持多层）
+        
+        _save_sim_state(calc_balance, final_positions)
+        print(f"✅ 已同步: balance={calc_balance:.4f}, positions={list(final_positions.keys())}")
+        _verify_sim_state(calc_balance, final_positions)
+
+    elif args.command == 'verify-sim':
+        _load_sim_state()
+        _verify_sim_state(_sim_balance, _sim_positions)
 
     elif args.command == 'scan':
         scan_candidates(args.min_change)
@@ -3011,7 +3609,7 @@ def main():
             os.dup2(_log_fd.fileno(), sys.stderr.fileno())
             _log_fd.write(datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '\n')
             _log_fd.flush()
-        scan_volatility_top(args.top, args.min_vol, args.klines)
+        scan_volatility_top(args.top, args.min_vol, args.klines if args.klines else args.top)
         if args.log:
             sys.stdout.flush()
             sys.stderr.flush()
@@ -3069,6 +3667,107 @@ def main():
             print("Error: --symbol is required")
             return
         do_llm_analysis(args.symbol, "hold")
+
+    elif args.command == 'factor-signal':
+        # 因子信号
+        import time
+        from factor_engine import FactorEngine, set_factor_engine
+        from binance_stream import DataManager
+        
+        print(f"\n{'='*50}")
+        print(f"🔬 因子信号 - {args.symbol}")
+        print(f"{'='*50}")
+        
+        fe = FactorEngine()
+        set_factor_engine(fe)
+        dm = DataManager(args.symbol)
+        dm.start()
+        
+        print(f"收集数据中...")
+        time.sleep(args.seconds)
+        
+        dm.stop()
+        
+        # 手动转换数据到因子引擎
+        ticks = list(dm.stream.ticks)
+        klines = list(dm.stream.klines)
+        
+        print(f"逐笔成交: {len(ticks)}, K线: {len(klines)}")
+        
+        # 添加到因子引擎
+        for t in ticks:
+            fe.add_tick(t['price'], t['qty'], t['is_buyer_maker'])
+        
+        for k in klines:
+            fe.add_kline(k)
+        
+        if ticks:
+            fe.set_last_price(ticks[-1]['price'])
+        
+        # 获取信号
+        signal, conf, details = fe.generate_signal()
+        
+        signal_names = {1: 'LONG', -1: 'SHORT', 0: 'NEUTRAL'}
+        
+        print(f"\n{'='*50}")
+        print(f"📊 因子信号: {signal_names.get(signal, 'NEUTRAL')}")
+        print(f"🎯 置信度: {conf:.2f}")
+        print(f"📝 详情: {details}")
+        print(f"{'='*50}")
+
+    elif args.command == 'factor-trade':
+        # 因子实盘交易
+        import time
+        from factor_v3 import TickData, generate_signal
+        from binance_stream import DataManager
+        import requests
+        
+        symbol = args.symbol.upper()
+        min_conf = args.min_conf
+        
+        print(f"\n{'='*60}")
+        print(f"🚀 因子实盘交易 - {symbol}")
+        print(f"{'='*60}")
+        print(f"保证金: {args.margin} USDT, 杠杆: {args.leverage}x")
+        print(f"最小置信度: {min_conf}")
+        
+        # 获取实时因子信号
+        url = 'https://api.binance.com/api/v3/aggTrades'
+        resp = requests.get(url, params={'symbol': symbol, 'limit': 800}, timeout=30, verify=False)
+        data = resp.json()
+        
+        ticks = [TickData(
+            price=float(t['p']),
+            qty=float(t['q']),
+            is_buyer_maker=t['m'],
+            time=t['T']
+        ) for t in data]
+        
+        signal, conf, details = generate_signal(ticks)
+        
+        signal_names = {1: 'LONG', -1: 'SHORT', 0: 'NEUTRAL'}
+        
+        print(f"\n📊 因子信号: {signal_names.get(signal, 'NEUTRAL')}")
+        print(f"🎯 置信度: {conf:.2f}")
+        print(f"📝 详情: {details}")
+        
+        # 检查是否开仓
+        if signal == 0:
+            print(f"⚠️ 信号中性，不开仓")
+        elif conf < min_conf:
+            print(f"⚠️ 置信度 {conf:.2f} < {min_conf}，不开仓")
+        else:
+            # 执行开仓
+            print(f"\n✅ 执行开仓...")
+            
+            if signal == 1:
+                result = do_open_long(symbol.replace('USDT', ''), args.margin, args.leverage)
+            else:
+                result = do_open_short(symbol.replace('USDT', ''), args.margin, args.leverage)
+            
+            print(f"开仓结果: {result}")
+
+        print(f"{'='*60}")
 
     elif args.command == 'replace-order':
         trader = BinanceTrader()
